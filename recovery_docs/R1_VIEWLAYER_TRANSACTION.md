@@ -66,7 +66,11 @@ Evidence:
 ## Boundaries
 
 - Frozen canonical v1.4.12 source: unchanged.
-- Real installed v1.4.12 extension: unchanged and not reloaded.
+- Real on-disk extension: unchanged and not reloaded; the final read-only
+  audit reports metadata v1.4.9 and `operators.py` SHA-256
+  `DD2ABD3BAE0FDD96597F410E2FE4ED27E7DC5A094C8750F824BE92B949BBE33E`.
+- Modules loaded inside production PID 13176: unknown and deliberately not
+  inspected or reloaded.
 - Real preferences: not saved.
 - Production Blender PID 13176: not controlled, closed, restarted, or saved.
 - Production `.blend`: not opened or saved.
