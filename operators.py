@@ -98,6 +98,7 @@ from .project_store import PROJECT_RECORD_KEY
 from .project_store import PROJECT_UUID_KEY
 from .project_store import ProjectStoreError
 from .project_store import project_objects_for_target
+from .project_store import repair_passive_target_uuid_copies
 from .project_store import read_composite_session
 from .project_store import read_project_record
 from .project_store import resolve_composite_objects
@@ -1717,6 +1718,78 @@ def _start_target(settings, active, surface_name=""):
     return None
 
 
+def _resolve_session_target(context, retopo):
+    settings = context.scene.flowpatch_retopo
+    try:
+        record = read_project_record(retopo)
+    except ProjectStoreError as exc:
+        SESSION_BREADCRUMBS.record(
+            "project_resume_rejected",
+            reason_code=exc.reason_code,
+            message=str(exc),
+        )
+        raise
+    if record is not None:
+        try:
+            target = find_object_by_uuid(
+                tuple(bpy.data.objects),
+                record.target_object_uuid,
+            )
+        except ProjectStoreError as exc:
+            configured = settings.target
+            if (
+                exc.reason_code == "DUPLICATE_OBJECT_UUID"
+                and configured is not None
+                and configured is not retopo
+            ):
+                try:
+                    repaired = repair_passive_target_uuid_copies(
+                        tuple(bpy.data.objects),
+                        configured,
+                        retopo,
+                    )
+                    target = find_object_by_uuid(
+                        tuple(bpy.data.objects),
+                        record.target_object_uuid,
+                    )
+                except ProjectStoreError as repair_exc:
+                    SESSION_BREADCRUMBS.record(
+                        "project_resume_rejected",
+                        reason_code=repair_exc.reason_code,
+                        message=str(repair_exc),
+                    )
+                    raise
+                SESSION_BREADCRUMBS.record(
+                    "target_uuid_copies_repaired",
+                    target=target.name,
+                    copies=tuple(repaired),
+                )
+            else:
+                SESSION_BREADCRUMBS.record(
+                    "project_resume_rejected",
+                    reason_code=exc.reason_code,
+                    message=str(exc),
+                )
+                raise
+        if target is None:
+            SESSION_BREADCRUMBS.record(
+                "project_resume_rejected",
+                reason_code="MISSING_TARGET_OBJECT",
+                target_uuid=record.target_object_uuid,
+            )
+            return None
+        settings.target = target
+        return target
+
+    target = settings.target
+    if target is None:
+        target_name = retopo.get("flowpatch_target_name", "")
+        target = bpy.data.objects.get(target_name)
+    if target is not None and target is not retopo:
+        settings.target = target
+    return target
+
+
 class FLOWPATCH_OT_start_session(Operator):
     bl_idname = "flowpatch.start_session"
     bl_label = "Start New FlowPatch Retopo"
@@ -1991,6 +2064,48 @@ class FLOWPATCH_OT_recover_project(Operator):
                 "Choose the original projection Surface before recovery.",
             )
             return {"CANCELLED"}
+
+        try:
+            existing_record = read_project_record(retopo)
+        except ProjectStoreError:
+            existing_record = None
+        if existing_record is not None:
+            try:
+                repaired = repair_passive_target_uuid_copies(
+                    tuple(bpy.data.objects),
+                    target,
+                    retopo,
+                )
+                existing_target = find_object_by_uuid(
+                    tuple(bpy.data.objects),
+                    existing_record.target_object_uuid,
+                )
+            except ProjectStoreError as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+            if existing_target is target:
+                settings = context.scene.flowpatch_retopo
+                settings.target = target
+                settings.continue_on = retopo
+                _run_project_audit("EXPLICIT_RECOVER")
+                if repaired:
+                    names = ", ".join(repaired)
+                    self.report(
+                        {"INFO"},
+                        (
+                            "Recovered copied Surface identity from "
+                            f"{names}; project metadata was preserved."
+                        ),
+                    )
+                else:
+                    self.report(
+                        {"INFO"},
+                        (
+                            f"Project {existing_record.project_uuid[:8]} is "
+                            "already valid; no metadata changed."
+                        ),
+                    )
+                return {"FINISHED"}
 
         existing_target = _project_target_for_object(retopo)
         if existing_target is not None:
@@ -3387,42 +3502,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         return True
 
     def _resolve_target(self, context):
-        settings = context.scene.flowpatch_retopo
-        retopo = context.edit_object
-        try:
-            record = read_project_record(retopo)
-        except ProjectStoreError as exc:
-            SESSION_BREADCRUMBS.record(
-                "project_resume_rejected",
-                reason_code=exc.reason_code,
-                message=str(exc),
-            )
-            return None
-        if record is not None:
-            try:
-                target = find_object_by_uuid(
-                    tuple(bpy.data.objects),
-                    record.target_object_uuid,
-                )
-            except ProjectStoreError as exc:
-                SESSION_BREADCRUMBS.record(
-                    "project_resume_rejected",
-                    reason_code=exc.reason_code,
-                    message=str(exc),
-                )
-                return None
-            if target is None:
-                return None
-            settings.target = target
-            return target
-
-        target = settings.target
-        if target is None:
-            target_name = retopo.get("flowpatch_target_name", "")
-            target = bpy.data.objects.get(target_name)
-        if target is not None and target is not context.edit_object:
-            settings.target = target
-        return target
+        return _resolve_session_target(context, context.edit_object)
 
     def _append_surface_sample(self, context, event, force=False):
         settings = context.scene.flowpatch_retopo
@@ -5444,7 +5524,16 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._cursor_active = False
         self._scene = context.scene
         self._retopo = context.edit_object
-        self._target = self._resolve_target(context)
+        try:
+            self._target = self._resolve_target(context)
+        except ProjectStoreError as exc:
+            SESSION_BREADCRUMBS.record(
+                "session_start_rejected",
+                reason_code=exc.reason_code,
+                message=str(exc),
+            )
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         if self._target is None or self._target.type != "MESH":
             SESSION_BREADCRUMBS.record(
                 "session_start_rejected",
@@ -6131,21 +6220,79 @@ class FLOWPATCH_OT_toggle_tool(Operator):
                 else {"CANCELLED"}
             )
 
-        if context.mode == "OBJECT":
-            settings = context.scene.flowpatch_retopo
-            active = context.active_object
-            target = _start_target(settings, active)
-            if target is None:
-                self.report({"ERROR"}, "Select the projection mesh first.")
+        if context.mode == "EDIT_MESH":
+            try:
+                target = _resolve_session_target(
+                    context,
+                    context.edit_object,
+                )
+            except ProjectStoreError as exc:
+                SESSION_BREADCRUMBS.record(
+                    "session_start_rejected",
+                    reason_code=exc.reason_code,
+                    message=str(exc),
+                    launch="F7",
+                )
+                self.report({"ERROR"}, str(exc))
                 return {"CANCELLED"}
-            result = bpy.ops.flowpatch.start_session(
-                "EXEC_DEFAULT",
-                surface_name=target.name,
-            )
-            if "FINISHED" not in result:
+            if target is None or target.type != "MESH":
+                SESSION_BREADCRUMBS.record(
+                    "session_start_rejected",
+                    reason_code="TARGET_REQUIRED",
+                    launch="F7",
+                )
+                self.report(
+                    {"ERROR"},
+                    (
+                        "Choose a mesh Surface in the FlowPatch panel "
+                        "before pressing F7."
+                    ),
+                )
+                return {"CANCELLED"}
+            if target is context.edit_object:
+                SESSION_BREADCRUMBS.record(
+                    "session_start_rejected",
+                    reason_code="TARGET_EQUALS_RETOPO",
+                    launch="F7",
+                )
+                self.report(
+                    {"ERROR"},
+                    (
+                        "The retopo mesh and projection Surface must be "
+                        "different objects."
+                    ),
+                )
                 return {"CANCELLED"}
 
-        result = bpy.ops.flowpatch.guide_session("INVOKE_DEFAULT")
+        try:
+            if context.mode == "OBJECT":
+                settings = context.scene.flowpatch_retopo
+                active = context.active_object
+                target = _start_target(settings, active)
+                if target is None:
+                    self.report({"ERROR"}, "Select the projection mesh first.")
+                    return {"CANCELLED"}
+                result = bpy.ops.flowpatch.start_session(
+                    "EXEC_DEFAULT",
+                    surface_name=target.name,
+                )
+                if "FINISHED" not in result:
+                    return {"CANCELLED"}
+
+            result = bpy.ops.flowpatch.guide_session("INVOKE_DEFAULT")
+        except RuntimeError as exc:
+            message = str(exc).strip()
+            if message.startswith("Error: "):
+                message = message[7:].strip()
+            message = message or "FlowPatch could not start."
+            SESSION_BREADCRUMBS.record(
+                "session_start_rejected",
+                reason_code="NESTED_OPERATOR_CANCELLED",
+                message=message,
+                launch="F7",
+            )
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
         if "RUNNING_MODAL" not in result:
             return {"CANCELLED"}
         return {"FINISHED"}

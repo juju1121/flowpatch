@@ -541,11 +541,114 @@ def find_object_by_uuid(objects, object_uuid):
         if current == wanted:
             matches.append(owner)
     if len(matches) > 1:
+        names = ", ".join(
+            _object_name(owner)
+            for owner in sorted(matches, key=_object_name)
+        )
         raise ProjectStoreError(
             "DUPLICATE_OBJECT_UUID",
-            f"More than one object owns UUID {wanted}.",
+            f"More than one object owns UUID {wanted}: {names}.",
         )
     return matches[0] if matches else None
+
+
+def repair_passive_target_uuid_copies(objects, preferred_target, project_owner):
+    owners = tuple(objects)
+    record = read_project_record(project_owner)
+    if record is None:
+        raise ProjectStoreError(
+            "MISSING_PROJECT_RECORD",
+            "The FlowPatch project has no stable ownership record to recover.",
+        )
+
+    preferred_uuid = _canonical_uuid(
+        preferred_target.get(OBJECT_UUID_KEY, ""),
+        "MISSING_TARGET_UUID",
+        f"Configured Surface UUID on {_object_name(preferred_target)}",
+    )
+    if preferred_uuid != record.target_object_uuid:
+        raise ProjectStoreError(
+            "CONFIGURED_TARGET_UUID_MISMATCH",
+            (
+                f"Configured Surface {_object_name(preferred_target)} does not "
+                "own the target UUID recorded by this FlowPatch project."
+            ),
+        )
+
+    matches = []
+    for owner in owners:
+        raw = owner.get(OBJECT_UUID_KEY, "")
+        if not raw:
+            continue
+        try:
+            current = _canonical_uuid(
+                raw,
+                "MALFORMED_OBJECT_UUID",
+                f"Object UUID on {_object_name(owner)}",
+            )
+        except ProjectStoreError:
+            continue
+        if current == preferred_uuid:
+            matches.append(owner)
+
+    if not any(owner is preferred_target for owner in matches):
+        raise ProjectStoreError(
+            "CONFIGURED_TARGET_NOT_FOUND",
+            "The configured Surface is not part of the current Blender data.",
+        )
+
+    passive = tuple(
+        sorted(
+            (
+                owner
+                for owner in matches
+                if owner is not preferred_target
+            ),
+            key=_object_name,
+        )
+    )
+    if not passive:
+        return ()
+
+    protected = tuple(
+        owner
+        for owner in passive
+        if PROJECT_UUID_KEY in owner or PROJECT_RECORD_KEY in owner
+    )
+    if protected:
+        names = ", ".join(_object_name(owner) for owner in protected)
+        raise ProjectStoreError(
+            "DUPLICATE_OBJECT_UUID_HAS_PROJECT",
+            (
+                "FlowPatch cannot automatically recover the copied Surface "
+                f"identity because {names} also owns project metadata."
+            ),
+        )
+
+    snapshots = {
+        id(owner): _snapshot_owner_keys(owner, (OBJECT_UUID_KEY,))
+        for owner in passive
+    }
+    try:
+        for owner in passive:
+            del owner[OBJECT_UUID_KEY]
+        resolved = find_object_by_uuid(owners, preferred_uuid)
+        if resolved is not preferred_target:
+            raise ProjectStoreError(
+                "DUPLICATE_OBJECT_UUID_REPAIR_FAILED",
+                "Surface ownership was still ambiguous after recovery.",
+            )
+    except Exception as exc:
+        for owner in passive:
+            _restore_owner_keys(owner, snapshots[id(owner)])
+        if isinstance(exc, ProjectStoreError):
+            raise
+        raise ProjectStoreError(
+            "DUPLICATE_OBJECT_UUID_REPAIR_FAILED",
+            "FlowPatch could not safely recover copied Surface ownership.",
+        ) from exc
+
+    return tuple(_object_name(owner) for owner in passive)
 
 
 def project_objects_for_target(objects, target_uuid):
