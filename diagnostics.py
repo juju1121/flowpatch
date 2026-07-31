@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 
 
-DEBUG_STATE_SCHEMA_VERSION = 1
+DEBUG_STATE_SCHEMA_VERSION = 2
 DEFAULT_BREADCRUMB_LIMIT = 96
 _MAX_COLLECTION_ITEMS = 64
 _MAX_SNAPSHOT_DEPTH = 6
@@ -172,6 +172,113 @@ TOOL_REGISTRY = ToolRegistry(
 )
 
 
+def safe_rna_attr(value, attribute, default=None):
+    if value is None:
+        return default
+    try:
+        return getattr(value, str(attribute), default)
+    except (ReferenceError, RuntimeError):
+        return default
+
+
+def safe_rna_get(value, key, default=None):
+    if value is None:
+        return default
+    try:
+        getter = getattr(value, "get", None)
+        return getter(key, default) if callable(getter) else default
+    except (ReferenceError, RuntimeError):
+        return default
+
+
+def safe_rna_name(value):
+    name = safe_rna_attr(value, "name", "")
+    return str(name) if isinstance(name, str) else ""
+
+
+def safe_rna_object(value):
+    if value is None:
+        return None
+    name = safe_rna_attr(value, "name", None)
+    object_type = safe_rna_attr(value, "type", None)
+    if not isinstance(name, str) or not isinstance(object_type, str):
+        return None
+    return value
+
+
+def _safe_collection(values):
+    if values is None:
+        return ()
+    try:
+        return tuple(values)
+    except (ReferenceError, RuntimeError, TypeError):
+        return ()
+
+
+def resolve_rna_object(
+    object_uuid,
+    object_name_hint="",
+    view_layer_objects=None,
+    data_objects=None,
+    uuid_key="flowpatch_object_uuid_v1",
+):
+    object_uuid = str(object_uuid or "")
+    object_name_hint = str(object_name_hint or "")
+    ordered = []
+    seen = set()
+    for source, values in (
+        ("VIEW_LAYER", view_layer_objects),
+        ("BLEND_DATA", data_objects),
+    ):
+        for value in _safe_collection(values):
+            live = safe_rna_object(value)
+            if live is None or id(live) in seen:
+                continue
+            seen.add(id(live))
+            ordered.append((source, live))
+
+    matches = []
+    if object_uuid:
+        matches = [
+            (source, value)
+            for source, value in ordered
+            if str(safe_rna_get(value, uuid_key, "") or "") == object_uuid
+        ]
+    elif object_name_hint:
+        matches = [
+            (source, value)
+            for source, value in ordered
+            if safe_rna_name(value) == object_name_hint
+        ]
+
+    status = {
+        "found": False,
+        "ambiguous": len(matches) > 1,
+        "object_uuid": object_uuid,
+        "object_name": "",
+        "object_name_hint": object_name_hint,
+        "source": "",
+        "in_view_layer": False,
+        "renamed": False,
+        "match_count": len(matches),
+    }
+    if len(matches) != 1:
+        return None, status
+
+    source, value = matches[0]
+    name = safe_rna_name(value)
+    status.update(
+        {
+            "found": True,
+            "object_name": name,
+            "source": source,
+            "in_view_layer": source == "VIEW_LAYER",
+            "renamed": bool(object_name_hint and name != object_name_hint),
+        }
+    )
+    return value, status
+
+
 def _json_safe(value, depth=0):
     if depth > _MAX_SNAPSHOT_DEPTH:
         return "<depth-limit>"
@@ -196,13 +303,13 @@ def _json_safe(value, depth=0):
             _json_safe(item, depth + 1)
             for item in ordered[:_MAX_COLLECTION_ITEMS]
         ]
-    to_tuple = getattr(value, "to_tuple", None)
+    to_tuple = safe_rna_attr(value, "to_tuple", None)
     if callable(to_tuple):
         try:
             return _json_safe(tuple(to_tuple()), depth + 1)
         except Exception:
             pass
-    name = getattr(value, "name", None)
+    name = safe_rna_attr(value, "name", None)
     if isinstance(name, str):
         return {
             "type": type(value).__name__,
@@ -253,10 +360,25 @@ def build_debug_document(
     capabilities=None,
     context_state=None,
     breadcrumbs=None,
+    build_identity=None,
+    project_state=None,
+    warnings=None,
+    last_exception=None,
 ):
     breadcrumbs = breadcrumbs or SESSION_BREADCRUMBS
+    project_state = dict(project_state or {})
     return {
         "schema_version": DEBUG_STATE_SCHEMA_VERSION,
+        "build_identity": _json_safe(build_identity or {}),
+        "project_object_found": bool(
+            project_state.get("project_object_found", False)
+        ),
+        "target_object_found": bool(
+            project_state.get("target_object_found", False)
+        ),
+        "project": _json_safe(project_state),
+        "warnings": _json_safe(list(warnings or ())),
+        "last_exception": _json_safe(last_exception),
         "context": _json_safe(context_state or {}),
         "session": _json_safe(session_state or {"active": False}),
         "tool_registry": TOOL_REGISTRY.inventory(capabilities),

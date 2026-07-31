@@ -1,4 +1,5 @@
 import math
+import os
 from collections import deque
 from copy import deepcopy
 
@@ -12,11 +13,20 @@ from bpy.types import Operator
 from mathutils import Matrix
 from mathutils import Vector
 
+from .build_identity import ADDON_VERSION_STRING
+from .build_identity import BUILD_ID
+from .build_identity import PACKAGE_PAYLOAD_HASH_SCOPE
+from .build_identity import PACKAGE_PAYLOAD_SHA256
+from .build_identity import SOURCE_BRANCH
 from .auto_build import AutoBuildPlanError
 from .auto_build import plan_auto_build
 from .diagnostics import build_debug_document
 from .diagnostics import CapabilityResult
 from .diagnostics import debug_document_json
+from .diagnostics import resolve_rna_object
+from .diagnostics import safe_rna_attr
+from .diagnostics import safe_rna_get
+from .diagnostics import safe_rna_name
 from .diagnostics import SESSION_BREADCRUMBS
 from .diagnostics import TOOL_REGISTRY
 from .drawing import FlowPatchPreviewRenderer
@@ -96,6 +106,7 @@ from .project_store import ensure_object_uuid
 from .project_store import find_object_by_uuid
 from .project_store import OBJECT_UUID_KEY
 from .project_store import PROJECT_RECORD_KEY
+from .project_store import PROJECT_SCHEMA_VERSION
 from .project_store import PROJECT_UUID_KEY
 from .project_store import ProjectStoreError
 from .project_store import project_objects_for_target
@@ -126,6 +137,13 @@ _SNAP_HARD_MAX_PX = 22.0
 _MAX_STROKE_SAMPLES = 4096
 _SESSION_EPOCH = 0
 _LAST_PROJECT_AUDIT = audit_snapshot(())
+_LAST_SESSION_IDENTITY = {
+    "project_uuid": "",
+    "retopo_object_uuid": "",
+    "retopo_object_name_hint": "",
+    "target_object_uuid": "",
+    "target_object_name_hint": "",
+}
 
 
 def _capture_flowpatch_id_properties(obj):
@@ -226,10 +244,10 @@ def _composite_debug_state(scene):
             "active": True,
             "session_uuid": record.session_uuid,
             "member_count": len(record.members),
-            "members": [obj.name for obj in objects],
+            "members": [safe_rna_name(obj) for obj in objects],
             "error": "",
         }
-    except ProjectStoreError as exc:
+    except (ProjectStoreError, ReferenceError, RuntimeError) as exc:
         return {
             "active": False,
             "session_uuid": "",
@@ -1229,8 +1247,285 @@ def _safe_int(value, default=0):
 
 
 def _object_name(value):
-    name = getattr(value, "name", None)
-    return str(name) if isinstance(name, str) else ""
+    return safe_rna_name(value)
+
+
+def _identity_from_session(session):
+    if session is not None:
+        identity = {
+            "project_uuid": str(
+                safe_rna_attr(session, "_project_uuid", "") or ""
+            ),
+            "retopo_object_uuid": str(
+                safe_rna_attr(session, "_retopo_object_uuid", "") or ""
+            ),
+            "retopo_object_name_hint": str(
+                safe_rna_attr(
+                    session,
+                    "_retopo_object_name_hint",
+                    "",
+                )
+                or ""
+            ),
+            "target_object_uuid": str(
+                safe_rna_attr(session, "_target_object_uuid", "") or ""
+            ),
+            "target_object_name_hint": str(
+                safe_rna_attr(
+                    session,
+                    "_target_object_name_hint",
+                    "",
+                )
+                or ""
+            ),
+        }
+        if any(identity.values()):
+            return identity
+    return {
+        "project_uuid": "",
+        "retopo_object_uuid": "",
+        "retopo_object_name_hint": "",
+        "target_object_uuid": "",
+        "target_object_name_hint": "",
+    }
+
+
+def _remember_session_identity(session, record, target, retopo):
+    global _LAST_SESSION_IDENTITY
+    identity = {
+        "project_uuid": str(record.project_uuid),
+        "retopo_object_uuid": str(record.retopo_object_uuid),
+        "retopo_object_name_hint": _object_name(retopo),
+        "target_object_uuid": str(record.target_object_uuid),
+        "target_object_name_hint": _object_name(target),
+    }
+    session._project_uuid = identity["project_uuid"]
+    session._retopo_object_uuid = identity["retopo_object_uuid"]
+    session._retopo_object_name_hint = identity[
+        "retopo_object_name_hint"
+    ]
+    session._target_object_uuid = identity["target_object_uuid"]
+    session._target_object_name_hint = identity[
+        "target_object_name_hint"
+    ]
+    _LAST_SESSION_IDENTITY = dict(identity)
+    return identity
+
+
+def _identity_from_context(context):
+    settings = safe_rna_attr(
+        safe_rna_attr(context, "scene", None),
+        "flowpatch_retopo",
+        None,
+    )
+    candidates = (
+        safe_rna_attr(context, "edit_object", None),
+        safe_rna_attr(context, "active_object", None),
+        safe_rna_attr(settings, "continue_on", None),
+    )
+    for candidate in candidates:
+        if safe_rna_attr(candidate, "type", "") != "MESH":
+            continue
+        try:
+            record = read_project_record(candidate)
+        except (ProjectStoreError, ReferenceError, RuntimeError):
+            continue
+        if record is None:
+            continue
+        return {
+            "project_uuid": str(record.project_uuid),
+            "retopo_object_uuid": str(record.retopo_object_uuid),
+            "retopo_object_name_hint": _object_name(candidate),
+            "target_object_uuid": str(record.target_object_uuid),
+            "target_object_name_hint": "",
+        }
+    return {
+        "project_uuid": "",
+        "retopo_object_uuid": "",
+        "retopo_object_name_hint": "",
+        "target_object_uuid": "",
+        "target_object_name_hint": "",
+    }
+
+
+def _diagnostic_identity(context, session):
+    identity = _identity_from_session(session)
+    if any(identity.values()):
+        return identity
+    context_identity = _identity_from_context(context)
+    last_identity = dict(_LAST_SESSION_IDENTITY)
+    if (
+        context_identity["project_uuid"]
+        and context_identity["project_uuid"]
+        == last_identity["project_uuid"]
+    ):
+        return last_identity
+    if any(context_identity.values()):
+        return context_identity
+    return last_identity
+
+
+def _diagnostic_object_sources(context):
+    view_layer = safe_rna_attr(context, "view_layer", None)
+    view_layer_objects = safe_rna_attr(view_layer, "objects", ())
+    blend_data = safe_rna_attr(context, "blend_data", None)
+    data_objects = safe_rna_attr(blend_data, "objects", None)
+    if data_objects is None:
+        data_objects = safe_rna_attr(
+            safe_rna_attr(bpy, "data", None),
+            "objects",
+            (),
+        )
+    return view_layer_objects, data_objects
+
+
+def _resolution_warning(label, status):
+    if status["ambiguous"]:
+        return (
+            f"{label} object UUID is ambiguous "
+            f"({status['match_count']} matches)"
+        )
+    if not status["found"]:
+        return f"{label} object missing"
+    if status["renamed"]:
+        return (
+            f"{label} object renamed from "
+            f"{status['object_name_hint']} to {status['object_name']}"
+        )
+    if not status["in_view_layer"]:
+        return f"{label} object is not linked to the active ViewLayer"
+    return ""
+
+
+def _project_diagnostic_state(context, session):
+    identity = _diagnostic_identity(context, session)
+    view_layer_objects, data_objects = _diagnostic_object_sources(context)
+    retopo, retopo_status = resolve_rna_object(
+        identity["retopo_object_uuid"],
+        identity["retopo_object_name_hint"],
+        view_layer_objects=view_layer_objects,
+        data_objects=data_objects,
+        uuid_key=OBJECT_UUID_KEY,
+    )
+    target, target_status = resolve_rna_object(
+        identity["target_object_uuid"],
+        identity["target_object_name_hint"],
+        view_layer_objects=view_layer_objects,
+        data_objects=data_objects,
+        uuid_key=OBJECT_UUID_KEY,
+    )
+
+    warnings = []
+    if not identity["retopo_object_uuid"]:
+        warnings.append("project identity unavailable")
+    else:
+        warning = _resolution_warning("project", retopo_status)
+        if warning:
+            warnings.append(warning)
+    if not identity["target_object_uuid"]:
+        warnings.append("target identity unavailable")
+    else:
+        warning = _resolution_warning("target", target_status)
+        if warning:
+            warnings.append(warning)
+
+    registry_found = False
+    registry_matches_identity = False
+    registry_error = ""
+    if retopo is not None:
+        try:
+            record = read_project_record(retopo)
+            registry_found = record is not None
+            if record is not None:
+                registry_matches_identity = bool(
+                    record.project_uuid == identity["project_uuid"]
+                    and record.retopo_object_uuid
+                    == identity["retopo_object_uuid"]
+                    and record.target_object_uuid
+                    == identity["target_object_uuid"]
+                )
+        except (ProjectStoreError, ReferenceError, RuntimeError) as exc:
+            registry_error = f"{type(exc).__name__}: {exc}"
+        if not registry_found:
+            warnings.append("project registry missing")
+        elif not registry_matches_identity:
+            warnings.append("project registry does not match session identity")
+    if registry_error:
+        warnings.append(f"project registry unreadable: {registry_error}")
+
+    return (
+        {
+            "project_uuid": identity["project_uuid"],
+            "project_schema_version": PROJECT_SCHEMA_VERSION,
+            "project_object_found": bool(retopo_status["found"]),
+            "target_object_found": bool(target_status["found"]),
+            "project_registry_found": bool(registry_found),
+            "project_registry_matches_identity": bool(
+                registry_matches_identity
+            ),
+            "project_registry_error": registry_error,
+            "retopo_object": retopo_status,
+            "target_object": target_status,
+        },
+        warnings,
+    )
+
+
+def _expected_installed_extension_path():
+    try:
+        root = bpy.utils.user_resource("EXTENSIONS")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return ""
+    if not root:
+        return ""
+    return os.path.abspath(
+        os.path.join(root, "user_default", "flowpatch_retopo")
+    )
+
+
+def _build_identity_state():
+    active_source_path = os.path.realpath(__file__)
+    active_addon_root = os.path.dirname(active_source_path)
+    installed_extension_path = _expected_installed_extension_path()
+    installed_extension_resolved_path = (
+        os.path.realpath(installed_extension_path)
+        if installed_extension_path
+        else ""
+    )
+    return {
+        "addon_version": ADDON_VERSION_STRING,
+        "build_id": BUILD_ID,
+        "source_branch": SOURCE_BRANCH,
+        "package_sha256": PACKAGE_PAYLOAD_SHA256,
+        "package_sha256_scope": PACKAGE_PAYLOAD_HASH_SCOPE,
+        "active_source_path": active_source_path,
+        "active_addon_root": active_addon_root,
+        "installed_extension_path": installed_extension_path,
+        "installed_extension_resolved_path": (
+            installed_extension_resolved_path
+        ),
+        "active_source_is_real_install": bool(
+            installed_extension_resolved_path
+            and os.path.normcase(active_addon_root)
+            == os.path.normcase(installed_extension_resolved_path)
+        ),
+        "project_schema_version": PROJECT_SCHEMA_VERSION,
+    }
+
+
+def _last_exception_snapshot():
+    for entry in reversed(SESSION_BREADCRUMBS.snapshot()):
+        details = entry.get("details", {})
+        error_type = str(details.get("error_type", "") or "")
+        message = str(details.get("message", "") or "")
+        if error_type or message:
+            return {
+                "sequence": int(entry.get("sequence", 0)),
+                "event": str(entry.get("event", "")),
+                "error_type": error_type,
+                "message": message,
+            }
+    return None
 
 
 def _pen_state_of(owner):
@@ -1346,14 +1641,29 @@ def _pen_can_append(owner):
     )
 
 
-def _session_debug_state(session):
+def _session_debug_state(
+    session,
+    context=None,
+    project_state=None,
+):
+    project_state = dict(project_state or {})
+    scene = safe_rna_attr(context, "scene", None)
     if session is None:
         return {
             "active": False,
             "project_audit": deepcopy(_LAST_PROJECT_AUDIT),
-            "composite": _composite_debug_state(
-                getattr(bpy.context, "scene", None)
-            ),
+            "composite": _composite_debug_state(scene),
+            "identity": {
+                "project_uuid": project_state.get("project_uuid", ""),
+                "retopo_object_uuid": project_state.get(
+                    "retopo_object",
+                    {},
+                ).get("object_uuid", ""),
+                "target_object_uuid": project_state.get(
+                    "target_object",
+                    {},
+                ).get("object_uuid", ""),
+            },
         }
     state = _pen_state_of(session)
     hover_snap = getattr(session, "_hover_snap_state", None)
@@ -1386,7 +1696,9 @@ def _session_debug_state(session):
             getattr(session, "_session_alive", False)
             and not getattr(session, "_cleaned", True)
         ),
-        "session_epoch": int(getattr(session, "_session_epoch", 0)),
+        "session_epoch": _safe_int(
+            safe_rna_attr(session, "_session_epoch", 0)
+        ),
         "mode": str(getattr(session, "_mode", "")),
         "pointer_state": str(getattr(session, "_pointer_state", "")),
         "drawing": bool(getattr(session, "_drawing", False)),
@@ -1402,9 +1714,7 @@ def _session_debug_state(session):
             "counts": sync_counts,
             "frozen_reasons": sync_reasons,
         },
-        "composite": _composite_debug_state(
-            getattr(session, "_scene", None)
-        ),
+        "composite": _composite_debug_state(scene),
         "validation_errors": list(
             getattr(session, "_validation_errors", None) or ()
         ),
@@ -1443,8 +1753,15 @@ def _session_debug_state(session):
             ),
         },
         "project_audit": deepcopy(_LAST_PROJECT_AUDIT),
-        "retopo_object": _object_name(getattr(session, "_retopo", None)),
-        "target_object": _object_name(getattr(session, "_target", None)),
+        "identity": _identity_from_session(session),
+        "retopo_object": project_state.get("retopo_object", {}).get(
+            "object_name",
+            "",
+        ),
+        "target_object": project_state.get("target_object", {}).get(
+            "object_name",
+            "",
+        ),
     }
 
 
@@ -1467,31 +1784,51 @@ def _clear_hover_snap(owner, reason_code=""):
 def build_debug_state_snapshot(context=None):
     context = context or getattr(bpy, "context", None)
     session = FLOWPATCH_OT_guide_session._active_instance
+    project_state, warnings = _project_diagnostic_state(context, session)
     capabilities = None
     if session is not None:
         try:
             capabilities = session._toolbar_capabilities(context)
         except Exception as exc:
+            warnings.append(
+                "tool capability snapshot unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            )
             SESSION_BREADCRUMBS.record(
                 "debug_capability_snapshot_failed",
                 error_type=type(exc).__name__,
                 message=str(exc),
             )
     context_state = {
-        "mode": str(getattr(context, "mode", "")),
+        "mode": str(safe_rna_attr(context, "mode", "") or ""),
         "active_object": _object_name(
-            getattr(context, "active_object", None)
+            safe_rna_attr(context, "active_object", None)
         ),
-        "edit_object": _object_name(getattr(context, "edit_object", None)),
+        "edit_object": _object_name(
+            safe_rna_attr(context, "edit_object", None)
+        ),
         "area_type": str(
-            getattr(getattr(context, "area", None), "type", "")
+            safe_rna_attr(
+                safe_rna_attr(context, "area", None),
+                "type",
+                "",
+            )
+            or ""
         ),
     }
     return build_debug_document(
-        session_state=_session_debug_state(session),
+        session_state=_session_debug_state(
+            session,
+            context=context,
+            project_state=project_state,
+        ),
         capabilities=capabilities,
         context_state=context_state,
         breadcrumbs=SESSION_BREADCRUMBS,
+        build_identity=_build_identity_state(),
+        project_state=project_state,
+        warnings=warnings,
+        last_exception=_last_exception_snapshot(),
     )
 
 
@@ -2336,28 +2673,29 @@ def _context_project_object(context):
         if session_class is not None
         else None
     )
-    settings = getattr(context.scene, "flowpatch_retopo", None)
+    scene = safe_rna_attr(context, "scene", None)
+    settings = safe_rna_attr(scene, "flowpatch_retopo", None)
     candidates = (
-        getattr(session, "_retopo", None),
-        getattr(context, "edit_object", None),
-        getattr(context, "active_object", None),
-        getattr(settings, "continue_on", None),
+        safe_rna_attr(session, "_retopo", None),
+        safe_rna_attr(context, "edit_object", None),
+        safe_rna_attr(context, "active_object", None),
+        safe_rna_attr(settings, "continue_on", None),
     )
     for obj in candidates:
-        if obj is None or obj.type != "MESH":
+        if safe_rna_attr(obj, "type", "") != "MESH":
             continue
         if (
-            obj.get(PROJECT_RECORD_KEY, "")
-            or obj.get(PROJECT_UUID_KEY, "")
-            or obj.get(GUIDE_DATA_KEY, "")
-            or obj.get("flowpatch_target_name", "")
+            safe_rna_get(obj, PROJECT_RECORD_KEY, "")
+            or safe_rna_get(obj, PROJECT_UUID_KEY, "")
+            or safe_rna_get(obj, GUIDE_DATA_KEY, "")
+            or safe_rna_get(obj, "flowpatch_target_name", "")
         ):
             return obj
 
-    active = getattr(context, "active_object", None)
-    if active is None or active.type != "MESH":
+    active = safe_rna_attr(context, "active_object", None)
+    if safe_rna_attr(active, "type", "") != "MESH":
         return None
-    target_uuid = active.get(OBJECT_UUID_KEY, "")
+    target_uuid = safe_rna_get(active, OBJECT_UUID_KEY, "")
     if not target_uuid:
         return None
     try:
@@ -3060,6 +3398,11 @@ class FLOWPATCH_OT_guide_session(Operator):
     _projector = None
     _retopo = None
     _target = None
+    _project_uuid = ""
+    _retopo_object_uuid = ""
+    _retopo_object_name_hint = ""
+    _target_object_uuid = ""
+    _target_object_name_hint = ""
     _guides = None
     _built_cells = None
     _previews = None
@@ -5892,6 +6235,11 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._cursor_active = False
         self._scene = context.scene
         self._retopo = context.edit_object
+        self._project_uuid = ""
+        self._retopo_object_uuid = ""
+        self._retopo_object_name_hint = _object_name(self._retopo)
+        self._target_object_uuid = ""
+        self._target_object_name_hint = ""
         try:
             self._target = self._resolve_target(context)
         except ProjectStoreError as exc:
@@ -5920,7 +6268,10 @@ class FLOWPATCH_OT_guide_session(Operator):
             )
             return {"CANCELLED"}
         try:
-            _bind_project_or_error(self._target, self._retopo)
+            project_record = _bind_project_or_error(
+                self._target,
+                self._retopo,
+            )
         except FlowPatchGeometryError as exc:
             SESSION_BREADCRUMBS.record(
                 "project_resume_rejected",
@@ -5929,6 +6280,12 @@ class FLOWPATCH_OT_guide_session(Operator):
             )
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        _remember_session_identity(
+            self,
+            project_record,
+            self._target,
+            self._retopo,
+        )
         context.scene.flowpatch_retopo.continue_on = self._retopo
         _run_project_audit("GUIDE_SESSION_START")
 
@@ -6003,6 +6360,9 @@ class FLOWPATCH_OT_guide_session(Operator):
                 session_epoch=self._session_epoch,
                 retopo_object=_object_name(self._retopo),
                 target_object=_object_name(self._target),
+                project_uuid=self._project_uuid,
+                retopo_object_uuid=self._retopo_object_uuid,
+                target_object_uuid=self._target_object_uuid,
                 guide_count=_safe_count(self._guides),
                 built_cell_count=_safe_count(self._built_cells),
             )
@@ -6425,7 +6785,14 @@ class FLOWPATCH_OT_copy_debug_state(Operator):
 
     @classmethod
     def poll(cls, context):
-        return getattr(context, "window_manager", None) is not None
+        try:
+            area = safe_rna_attr(context, "area", None)
+            return bool(
+                safe_rna_attr(context, "window_manager", None) is not None
+                and safe_rna_attr(area, "type", "") == "VIEW_3D"
+            )
+        except (ReferenceError, RuntimeError):
+            return False
 
     def execute(self, context):
         session = FLOWPATCH_OT_guide_session._active_instance

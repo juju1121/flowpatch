@@ -1,5 +1,6 @@
 from bpy.types import Panel
 
+from .build_identity import compact_build_label
 from .project_store import find_object_by_uuid
 from .project_store import ProjectStoreError
 from .project_store import read_composite_session
@@ -55,6 +56,7 @@ class VIEW3D_PT_flowpatch_retopo(Panel):
 
         title = layout.box()
         title.label(text="FLOWPATCH  V1", icon="MESH_GRID")
+        title.label(text=compact_build_label(), icon="INFO")
         title.operator(
             "flowpatch.copy_debug_state",
             text="Copy Debug State",
