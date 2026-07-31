@@ -2,6 +2,7 @@
 
 Date: 2026-07-31
 Branch: `recovery/v1.4.12-core`
+GitHub: `https://github.com/juju1121/flowpatch/tree/recovery/v1.4.12-core`
 Status: SOURCE-ONLY RECOVERY BASELINE - DO NOT INSTALL
 
 ## Baselines
