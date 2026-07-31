@@ -1,7 +1,7 @@
 # Recovery P0 Safe Diagnostics And Build Identity
 
 Date: 2026-07-31
-Status: COMPLETE - PACKAGED - BACKGROUND VERIFIED - USER FOREGROUND PENDING
+Status: COMPLETE - PACKAGED - BACKGROUND VERIFIED - USER FOREGROUND ACCEPTED
 
 ## Scope
 
@@ -49,6 +49,26 @@ unchanged.
 Evidence:
 `D:\BlenderLibrary\project file\FlowPatch Retopo\test_runs\recovery_p0_20260731`
 
+## Foreground Acceptance
+
+User-supplied foreground diagnostics on 2026-07-31 confirmed the installed
+`v1.4.14` build, build ID `recovery-p0-safe-diagnostics-20260731`, and runtime
+payload digest
+`9D81F27C9D7D24472BC33809F174712ED7F60ED7B9D57E9D3DACDD3E027C397F`.
+
+After the retopo object was removed from the active ViewLayer, Copy Debug
+State returned valid JSON instead of a traceback. It resolved the still-live
+object from `BLEND_DATA`, reported `in_view_layer: false`, retained the target
+from `VIEW_LAYER`, emitted `project object is not linked to the active
+ViewLayer`, and reported `last_exception: null` with zero project-audit issues.
+
+Foreground evidence:
+`D:\Codex Project\.codex\attachments\f92e284c-432b-47cd-8934-54113468b676\pasted-text.txt`
+
+This accepts the user-accessible unlinked/ViewLayer failure path. Complete
+datablock removal and stale-RNA wrapper handling remain automated Blender
+fixture evidence rather than foreground evidence.
+
 ## Identity
 
 - Add-on version: `1.4.14`.
@@ -68,16 +88,18 @@ ZIP cannot contain its own final digest.
 ## Boundaries
 
 - Frozen canonical source: unchanged.
-- Real installed extension: unchanged and not reloaded.
+- Real installed extension: user-installed `v1.4.14` was foreground-proven as
+  the active source; Codex did not install or reload it.
 - Production Blender PID `13176`: alive, dirty, unsaved, and untouched.
 - Real preferences: not saved.
 - Production `.blend`: not opened or saved.
-- Foreground Blender and Computer Use: not launched for P0; the handoff assigns
-  foreground acceptance to the user.
-- Restart persistence: not tested because P0 was not installed.
+- Foreground Blender: user test accepted for the unlinked/ViewLayer path;
+  Codex did not control the session.
+- Computer Use: not used for P0 acceptance.
+- Restart persistence: not tested.
 
 ## Next Batch
 
-Stop after P0 packaging and user foreground acceptance. P1 surface anchors is
-next. P2 contour normalization and P3 general all-quad fallback own the n-gon
-work; P4-P8 remain later isolated batches.
+P0 is accepted. P1 surface anchors is next as one isolated batch. P2 contour
+normalization and P3 general all-quad fallback own the n-gon work; P4-P8 remain
+later isolated batches.
