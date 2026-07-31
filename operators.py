@@ -6,6 +6,7 @@ import bmesh
 import bpy
 from bpy.app.handlers import persistent
 from bpy_extras import view3d_utils
+from bpy.props import BoolProperty
 from bpy.props import StringProperty
 from bpy.types import Operator
 from mathutils import Matrix
@@ -1571,7 +1572,7 @@ def _activate_project_object(retopo, target):
     retopo.hide_viewport = False
     retopo.hide_set(False)
     retopo["flowpatch_target_name"] = target.name
-    retopo["flowpatch_session_active"] = True
+    retopo["flowpatch_session_active"] = False
     return retopo
 
 
@@ -1580,6 +1581,260 @@ def _bind_project_or_error(target, retopo):
         return bind_project(target, retopo)
     except ProjectStoreError as exc:
         raise FlowPatchGeometryError(str(exc)) from exc
+
+
+_SESSION_START_OWNER_KEYS = (
+    OBJECT_UUID_KEY,
+    PROJECT_UUID_KEY,
+    PROJECT_RECORD_KEY,
+    "flowpatch_target_name",
+    "flowpatch_session_active",
+)
+
+_SESSION_START_SETTING_KEYS = (
+    "target",
+    "continue_on",
+    "session_active",
+    "session_tool",
+    "session_status",
+    "session_validation",
+    "session_guide_count",
+    "session_cell_count",
+    "session_active_cell",
+    "session_sync_state",
+    "session_sync_message",
+)
+
+
+class SessionStartTransactionError(FlowPatchGeometryError):
+    def __init__(self, reason_code, step, message):
+        super().__init__(message)
+        self.reason_code = str(reason_code)
+        self.step = str(step)
+
+
+def _object_in_active_view_layer(context, obj):
+    return (
+        obj is not None
+        and context.view_layer.objects.get(obj.name) is obj
+    )
+
+
+def _active_view_layer_collection(context):
+    layer_collection = getattr(
+        context.view_layer,
+        "active_layer_collection",
+        None,
+    )
+    collection = getattr(layer_collection, "collection", None)
+    if collection is None:
+        collection = getattr(context, "collection", None)
+    if collection is None:
+        collection = context.scene.collection
+    return collection
+
+
+def _ensure_session_object_in_view_layer(context, retopo):
+    if _object_in_active_view_layer(context, retopo):
+        return None
+
+    collection = _active_view_layer_collection(context)
+    added_link = False
+    try:
+        if collection.objects.get(retopo.name) is not retopo:
+            collection.objects.link(retopo)
+            added_link = True
+        context.view_layer.update()
+        if not _object_in_active_view_layer(context, retopo):
+            raise SessionStartTransactionError(
+                "VIEW_LAYER_MEMBERSHIP_FAILED",
+                "verify_view_layer",
+                (
+                    f"Object '{retopo.name}' could not be linked to active "
+                    f"ViewLayer '{context.view_layer.name}'."
+                ),
+            )
+    except Exception:
+        if added_link and collection.objects.get(retopo.name) is retopo:
+            collection.objects.unlink(retopo)
+            context.view_layer.update()
+        raise
+    return collection if added_link else None
+
+
+def _snapshot_owner_properties(owner):
+    return {
+        key: (key in owner, deepcopy(owner.get(key)))
+        for key in _SESSION_START_OWNER_KEYS
+    }
+
+
+def _restore_owner_properties(owner, snapshot):
+    for key, (existed, value) in snapshot.items():
+        if existed:
+            owner[key] = deepcopy(value)
+        elif key in owner:
+            del owner[key]
+
+
+class _SessionStartTransaction:
+    def __init__(self, context, target, continue_on):
+        self.context = context
+        self.settings = context.scene.flowpatch_retopo
+        self.start_mode = str(context.mode)
+        self.start_active = context.view_layer.objects.active
+        self.start_selected = tuple(context.selected_objects)
+        self.setting_snapshot = {
+            key: getattr(self.settings, key)
+            for key in _SESSION_START_SETTING_KEYS
+        }
+        self.owner_snapshots = []
+        self.visibility_snapshot = None
+        self.added_links = []
+        self.created_object = None
+        self.created_mesh = None
+        self.initial_objects = tuple(bpy.data.objects)
+        self.initial_meshes = tuple(bpy.data.meshes)
+        for owner in self.initial_objects:
+            if (
+                owner is target
+                or owner is continue_on
+                or any(key in owner for key in _SESSION_START_OWNER_KEYS)
+            ):
+                self.capture_owner(owner)
+
+    def capture_owner(self, owner):
+        if owner is None or any(
+            existing is owner for existing, _snapshot in self.owner_snapshots
+        ):
+            return
+        self.owner_snapshots.append(
+            (owner, _snapshot_owner_properties(owner))
+        )
+
+    def capture_retopo(self, retopo):
+        if not any(existing is retopo for existing in self.initial_objects):
+            self.created_object = retopo
+            mesh = getattr(retopo, "data", None)
+            if mesh is not None and not any(
+                existing is mesh for existing in self.initial_meshes
+            ):
+                self.created_mesh = mesh
+            return
+        self.capture_owner(retopo)
+        hidden = None
+        if _object_in_active_view_layer(self.context, retopo):
+            hidden = retopo.hide_get(view_layer=self.context.view_layer)
+        self.visibility_snapshot = (
+            retopo,
+            bool(retopo.show_in_front),
+            bool(retopo.hide_viewport),
+            hidden,
+        )
+
+    def record_link(self, collection, retopo):
+        if collection is not None:
+            self.added_links.append((collection, retopo))
+
+    def rollback(self):
+        errors = []
+        context = self.context
+        session_class = globals().get("FLOWPATCH_OT_guide_session")
+        session = (
+            getattr(session_class, "_active_instance", None)
+            if session_class is not None
+            else None
+        )
+        if session is not None:
+            try:
+                session._cleanup(context)
+            except Exception as exc:
+                errors.append(f"cleanup_modal_session: {exc}")
+        if context.mode == "EDIT_MESH":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as exc:
+                errors.append(f"leave_edit_mode: {exc}")
+
+        for owner, snapshot in self.owner_snapshots:
+            if bpy.data.objects.get(owner.name) is owner:
+                try:
+                    _restore_owner_properties(owner, snapshot)
+                except Exception as exc:
+                    errors.append(f"restore_owner:{owner.name}: {exc}")
+
+        if self.visibility_snapshot is not None:
+            retopo, show_in_front, hide_viewport, hidden = self.visibility_snapshot
+            if bpy.data.objects.get(retopo.name) is retopo:
+                try:
+                    retopo.show_in_front = show_in_front
+                    retopo.hide_viewport = hide_viewport
+                    if hidden is not None and _object_in_active_view_layer(
+                        context,
+                        retopo,
+                    ):
+                        retopo.hide_set(
+                            hidden,
+                            view_layer=context.view_layer,
+                        )
+                except Exception as exc:
+                    errors.append(f"restore_visibility:{retopo.name}: {exc}")
+
+        for collection, retopo in reversed(self.added_links):
+            if collection.objects.get(retopo.name) is retopo:
+                try:
+                    collection.objects.unlink(retopo)
+                except Exception as exc:
+                    errors.append(f"unlink:{retopo.name}: {exc}")
+
+        if (
+            self.created_object is not None
+            and bpy.data.objects.get(self.created_object.name)
+            is self.created_object
+        ):
+            try:
+                bpy.data.objects.remove(self.created_object, do_unlink=True)
+            except Exception as exc:
+                errors.append(f"remove_object: {exc}")
+        if self.created_mesh is not None and self.created_mesh.users == 0:
+            try:
+                bpy.data.meshes.remove(self.created_mesh)
+            except Exception as exc:
+                errors.append(f"remove_mesh: {exc}")
+
+        for key, value in self.setting_snapshot.items():
+            try:
+                setattr(self.settings, key, value)
+            except Exception as exc:
+                errors.append(f"restore_setting:{key}: {exc}")
+
+        try:
+            context.view_layer.update()
+        except Exception as exc:
+            errors.append(f"update_view_layer: {exc}")
+
+        try:
+            for obj in tuple(context.selected_objects):
+                obj.select_set(False, view_layer=context.view_layer)
+            for obj in self.start_selected:
+                if _object_in_active_view_layer(context, obj):
+                    obj.select_set(True, view_layer=context.view_layer)
+            if _object_in_active_view_layer(context, self.start_active):
+                context.view_layer.objects.active = self.start_active
+            else:
+                context.view_layer.objects.active = None
+            if (
+                self.start_mode == "EDIT_MESH"
+                and _object_in_active_view_layer(context, self.start_active)
+            ):
+                self.start_active.select_set(
+                    True,
+                    view_layer=context.view_layer,
+                )
+                bpy.ops.object.mode_set(mode="EDIT")
+        except Exception as exc:
+            errors.append(f"restore_context: {exc}")
+        return tuple(errors)
 
 
 def create_session_object(context, target):
@@ -1592,23 +1847,14 @@ def create_session_object(context, target):
     retopo = bpy.data.objects.new(f"{target.name}_FlowPatch", mesh)
     retopo.matrix_world = target.matrix_world.copy()
     retopo.show_in_front = False
-    collection = context.collection
-    if collection is None:
-        collection = (
-            target.users_collection[0]
-            if target.users_collection
-            else context.scene.collection
-        )
-    collection.objects.link(retopo)
     try:
+        _ensure_session_object_in_view_layer(context, retopo)
         _bind_project_or_error(target, retopo)
     except Exception:
         bpy.data.objects.remove(retopo, do_unlink=True)
         if mesh.users == 0:
             bpy.data.meshes.remove(mesh)
         raise
-    retopo["flowpatch_target_name"] = target.name
-    retopo["flowpatch_session_active"] = True
     return retopo
 
 
@@ -1632,7 +1878,7 @@ def prepare_session_object(context, target, continue_on=None):
     _run_project_audit("SESSION_START")
     if continue_on is not None:
         _bind_project_or_error(target, continue_on)
-        return _activate_project_object(continue_on, target)
+        return continue_on
 
     try:
         target_uuid = ensure_object_uuid(target)
@@ -1657,7 +1903,7 @@ def prepare_session_object(context, target, continue_on=None):
         )
     if candidates:
         _bind_project_or_error(target, candidates[0])
-        return _activate_project_object(candidates[0], target)
+        return candidates[0]
 
     legacy = _legacy_project_candidates(target)
     if len(legacy) > 1:
@@ -1670,7 +1916,7 @@ def prepare_session_object(context, target, continue_on=None):
         )
     if legacy:
         _bind_project_or_error(target, legacy[0])
-        return _activate_project_object(legacy[0], target)
+        return legacy[0]
 
     return create_session_object(context, target)
 
@@ -1790,6 +2036,47 @@ def _resolve_session_target(context, retopo):
     return target
 
 
+def _select_session_edit_members(context, retopo):
+    if not _object_in_active_view_layer(context, retopo):
+        raise SessionStartTransactionError(
+            "VIEW_LAYER_MEMBERSHIP_LOST",
+            "select_retopo",
+            (
+                f"Object '{retopo.name}' is not in active ViewLayer "
+                f"'{context.view_layer.name}'."
+            ),
+        )
+
+    for obj in tuple(context.selected_objects):
+        obj.select_set(False, view_layer=context.view_layer)
+    composite_members = _composite_objects(context.scene)
+    edit_members = (
+        composite_members
+        if retopo in composite_members
+        else (retopo,)
+    )
+    selected_member_count = 0
+    for obj in edit_members:
+        if not _object_in_active_view_layer(context, obj):
+            continue
+        obj.select_set(True, view_layer=context.view_layer)
+        selected_member_count += 1
+
+    if not retopo.select_get(view_layer=context.view_layer):
+        retopo.select_set(True, view_layer=context.view_layer)
+    context.view_layer.objects.active = retopo
+    if (
+        context.view_layer.objects.active is not retopo
+        or not retopo.select_get(view_layer=context.view_layer)
+    ):
+        raise SessionStartTransactionError(
+            "VIEW_LAYER_ACTIVATION_FAILED",
+            "activate_retopo",
+            f"Object '{retopo.name}' could not become active and selected.",
+        )
+    return selected_member_count
+
+
 class FLOWPATCH_OT_start_session(Operator):
     bl_idname = "flowpatch.start_session"
     bl_label = "Start New FlowPatch Retopo"
@@ -1800,6 +2087,7 @@ class FLOWPATCH_OT_start_session(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     surface_name: StringProperty(options={"HIDDEN"})
+    launch_modal: BoolProperty(default=True, options={"HIDDEN"})
 
     @classmethod
     def poll(cls, context):
@@ -1830,67 +2118,147 @@ class FLOWPATCH_OT_start_session(Operator):
 
     def execute(self, context):
         settings = context.scene.flowpatch_retopo
+        transaction = _SessionStartTransaction(
+            context,
+            None,
+            settings.continue_on,
+        )
+        step = "resolve_target"
         start_mode = context.mode
-        active_candidate = (
-            context.edit_object
-            if start_mode == "EDIT_MESH"
-            else context.active_object
-        )
-        target = _start_target(
-            settings,
-            context.active_object,
-            self.surface_name,
-        )
-        continue_on = settings.continue_on
-        if (
-            continue_on is None
-            and active_candidate is not None
-            and active_candidate.type == "MESH"
-            and active_candidate is not target
-            and settings.target is target
-        ):
-            continue_on = active_candidate
-        attached_plain_mesh = bool(
-            continue_on is not None
-            and not continue_on.get(PROJECT_RECORD_KEY, "")
-        )
         try:
+            active_candidate = (
+                context.edit_object
+                if start_mode == "EDIT_MESH"
+                else context.active_object
+            )
+            target = _start_target(
+                settings,
+                context.active_object,
+                self.surface_name,
+            )
+            continue_on = settings.continue_on
+            if (
+                continue_on is None
+                and active_candidate is not None
+                and active_candidate.type == "MESH"
+                and active_candidate is not target
+                and settings.target is target
+            ):
+                continue_on = active_candidate
+            transaction.capture_owner(target)
+            transaction.capture_owner(continue_on)
+            attached_plain_mesh = bool(
+                continue_on is not None
+                and not continue_on.get(PROJECT_RECORD_KEY, "")
+            )
+
+            step = "validate_inputs"
             validate_session_inputs(target, continue_on)
-        except FlowPatchGeometryError as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        if context.mode == "EDIT_MESH":
-            bpy.ops.object.mode_set(mode="OBJECT")
-        try:
+            if context.mode == "EDIT_MESH":
+                step = "leave_edit_mode"
+                result = bpy.ops.object.mode_set(mode="OBJECT")
+                if "FINISHED" not in result or context.mode != "OBJECT":
+                    raise SessionStartTransactionError(
+                        "OBJECT_MODE_REQUIRED",
+                        step,
+                        "FlowPatch could not leave Edit Mode before startup.",
+                    )
+
+            step = "prepare_project"
             retopo = prepare_session_object(
                 context,
                 target,
                 continue_on=continue_on,
             )
-        except FlowPatchGeometryError as exc:
-            self.report({"ERROR"}, str(exc))
+            transaction.capture_retopo(retopo)
+
+            step = "link_view_layer"
+            added_collection = _ensure_session_object_in_view_layer(
+                context,
+                retopo,
+            )
+            transaction.record_link(added_collection, retopo)
+
+            step = "activate_project"
+            _activate_project_object(retopo, target)
+
+            settings.target = target
+            settings.continue_on = retopo
+            step = "select_retopo"
+            selected_member_count = _select_session_edit_members(
+                context,
+                retopo,
+            )
+            step = "enter_edit_mode"
+            result = bpy.ops.object.mode_set(mode="EDIT")
+            if (
+                "FINISHED" not in result
+                or context.mode != "EDIT_MESH"
+                or context.edit_object is not retopo
+            ):
+                raise SessionStartTransactionError(
+                    "EDIT_MODE_START_FAILED",
+                    step,
+                    f"Object '{retopo.name}' could not enter Edit Mode.",
+                )
+            if bool(getattr(self, "launch_modal", True)):
+                step = "start_guide_session"
+                try:
+                    modal_result = bpy.ops.flowpatch.guide_session(
+                        "INVOKE_DEFAULT"
+                    )
+                except RuntimeError as modal_exc:
+                    modal_message = str(modal_exc).strip()
+                    if modal_message.startswith("Error: "):
+                        modal_message = modal_message[7:].strip()
+                    raise SessionStartTransactionError(
+                        "GUIDE_SESSION_START_FAILED",
+                        step,
+                        modal_message or "FlowPatch guide session could not start.",
+                    ) from modal_exc
+                active_session = FLOWPATCH_OT_guide_session._active_instance
+                if (
+                    "RUNNING_MODAL" not in modal_result
+                    or active_session is None
+                    or active_session._retopo is not retopo
+                    or not settings.session_active
+                    or not bool(retopo.get("flowpatch_session_active", False))
+                ):
+                    raise SessionStartTransactionError(
+                        "GUIDE_SESSION_NOT_ACTIVE",
+                        step,
+                        "FlowPatch guide session did not become active.",
+                    )
+        except Exception as exc:
+            rollback_errors = transaction.rollback()
+            if isinstance(exc, SessionStartTransactionError):
+                reason_code = exc.reason_code
+                failed_step = exc.step
+                message = str(exc)
+            elif isinstance(exc, FlowPatchGeometryError):
+                reason_code = "SESSION_START_REJECTED"
+                failed_step = step
+                message = str(exc)
+            else:
+                reason_code = "SESSION_START_EXCEPTION"
+                failed_step = step
+                message = f"FlowPatch could not start during {step}: {exc}"
+            SESSION_BREADCRUMBS.record(
+                "session_start_transaction_failed",
+                reason_code=reason_code,
+                step=failed_step,
+                message=message,
+                rollback_errors=rollback_errors,
+            )
+            self.report({"ERROR"}, message)
             return {"CANCELLED"}
 
-        settings.target = target
-        settings.continue_on = retopo
-        for obj in context.selected_objects:
-            obj.select_set(False)
-        composite_members = _composite_objects(context.scene)
-        edit_members = (
-            composite_members
-            if retopo in composite_members
-            else (retopo,)
+        SESSION_BREADCRUMBS.record(
+            "session_start_transaction_committed",
+            retopo_object=retopo.name,
+            target_object=target.name,
+            view_layer=context.view_layer.name,
         )
-        selected_member_count = 0
-        for obj in edit_members:
-            if context.view_layer.objects.get(obj.name) is not obj:
-                continue
-            obj.select_set(True)
-            selected_member_count += 1
-        if not retopo.select_get():
-            retopo.select_set(True)
-        context.view_layer.objects.active = retopo
-        bpy.ops.object.mode_set(mode="EDIT")
         self.report(
             {"INFO"},
             (
@@ -5665,6 +6033,7 @@ class FLOWPATCH_OT_guide_session(Operator):
                 ),
             )
             context.window_manager.modal_handler_add(self)
+            self._retopo["flowpatch_session_active"] = True
             SESSION_BREADCRUMBS.record(
                 "session_started",
                 session_epoch=self._session_epoch,
@@ -6275,9 +6644,11 @@ class FLOWPATCH_OT_toggle_tool(Operator):
                 result = bpy.ops.flowpatch.start_session(
                     "EXEC_DEFAULT",
                     surface_name=target.name,
+                    launch_modal=True,
                 )
                 if "FINISHED" not in result:
                     return {"CANCELLED"}
+                return {"FINISHED"}
 
             result = bpy.ops.flowpatch.guide_session("INVOKE_DEFAULT")
         except RuntimeError as exc:
