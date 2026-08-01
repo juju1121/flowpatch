@@ -1,14 +1,14 @@
-ADDON_VERSION = (1, 4, 17)
+ADDON_VERSION = (1, 4, 18)
 ADDON_VERSION_STRING = ".".join(str(value) for value in ADDON_VERSION)
-BUILD_ID = "recovery-p1-draw-sampling-20260731"
+BUILD_ID = "recovery-m0-guide-delete-20260731"
 SOURCE_BRANCH = "recovery/v1.4.12-core"
 
 # This digest covers the canonical runtime payload, excluding this metadata
 # file so the value is reproducible rather than self-referential. The exact
 # ZIP archive digest is delivered beside the package as a detached checksum.
 PACKAGE_PAYLOAD_SHA256 = (
-    "46C85DAAA7102D754529C038639012CA"
-    "0118C0849ADD3B73902375744932C7B4"
+    "54CB5B17924F9D431155149D8128755E"
+    "6BA16A444533BE2F79D64DA8E09B1959"
 )
 PACKAGE_PAYLOAD_HASH_SCOPE = (
     "canonical packaged runtime files except build_identity.py; "

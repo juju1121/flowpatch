@@ -16,6 +16,34 @@ class GuideGraphBudgetError(RuntimeError):
     """Raised when a guide operation would exceed a safe interactive budget."""
 
 
+class GuideDeleteError(RuntimeError):
+    """Raised when a guide deletion target is unsafe or ambiguous."""
+
+    def __init__(self, reason_code, message):
+        super().__init__(str(message))
+        self.reason_code = str(reason_code)
+
+
+@dataclass(frozen=True)
+class GuideDeleteResult:
+    target_kind: str
+    changed_guide_ids: tuple = ()
+    removed_guide_ids: tuple = ()
+    removed_node_ids: tuple = ()
+    message: str = ""
+
+    @property
+    def affected_guide_ids(self):
+        return tuple(
+            sorted(
+                {
+                    int(value)
+                    for value in self.changed_guide_ids + self.removed_guide_ids
+                }
+            )
+        )
+
+
 def _segments_aabb_overlap(a0, a1, b0, b1, padding):
     for axis in range(3):
         if max(a0[axis], a1[axis]) + padding < min(b0[axis], b1[axis]):
@@ -280,6 +308,249 @@ def connected_guide_indices(guides, seed_index):
                 visited.add(neighbor_index)
                 pending.append(neighbor_index)
     return tuple(sorted(visited))
+
+
+def _guide_index_for_id(guides, guide_id):
+    guide_id = int(guide_id)
+    return next(
+        (
+            index
+            for index, guide in enumerate(guides)
+            if int(guide.guide_id) == guide_id
+        ),
+        None,
+    )
+
+
+def _node_incidence(guides, node_id):
+    node_id = int(node_id)
+    incidence = []
+    for guide_index, guide in enumerate(guides):
+        if int(guide.start_node) == node_id:
+            incidence.append((guide_index, "START"))
+        if int(guide.end_node) == node_id:
+            incidence.append((guide_index, "END"))
+    return tuple(incidence)
+
+
+def _without_index(values, index):
+    return tuple(value for value_index, value in enumerate(values) if value_index != index)
+
+
+def delete_guide_control(guides, guide_id, point_index):
+    guide_index = _guide_index_for_id(guides, guide_id)
+    if guide_index is None:
+        raise GuideDeleteError(
+            "GUIDE_NOT_FOUND",
+            "The selected guide no longer exists.",
+        )
+    guide = guides[guide_index]
+    point_index = int(point_index)
+    point_count = len(guide.points_local)
+    if not (0 <= point_index < point_count):
+        raise GuideDeleteError(
+            "CONTROL_NOT_FOUND",
+            "The selected guide control no longer exists.",
+        )
+    if point_index in {0, point_count - 1}:
+        raise GuideDeleteError(
+            "CONTROL_IS_NODE",
+            "That control is a topological GuideNode, not an interior sample.",
+        )
+
+    guide.points_local = [
+        point.copy()
+        for index, point in enumerate(guide.points_local)
+        if index != point_index
+    ]
+    if len(guide.anchors) == point_count:
+        guide.anchors = tuple(
+            anchor.copy()
+            for index, anchor in enumerate(guide.anchors)
+            if index != point_index
+        )
+    else:
+        guide.anchors = ()
+    if len(guide.source_vertex_uids) == point_count:
+        guide.source_vertex_uids = _without_index(
+            guide.source_vertex_uids,
+            point_index,
+        )
+    elif guide.source_vertex_uids:
+        guide.source_vertex_uids = ()
+    return GuideDeleteResult(
+        target_kind="CONTROL",
+        changed_guide_ids=(int(guide.guide_id),),
+        message="Guide control removed; endpoints were preserved.",
+    )
+
+
+def _oriented_toward_node(guide, endpoint):
+    reverse = str(endpoint) == "START"
+    points = [point.copy() for point in guide.points_local]
+    anchors = tuple(anchor.copy() for anchor in guide.anchors)
+    source_uids = tuple(int(value) for value in guide.source_vertex_uids)
+    if reverse:
+        points.reverse()
+        anchors = tuple(reversed(anchors))
+        source_uids = tuple(reversed(source_uids))
+    outer_node = (
+        int(guide.end_node)
+        if str(endpoint) == "START"
+        else int(guide.start_node)
+    )
+    return outer_node, points, anchors, source_uids
+
+
+def delete_guide_node(guides, node_id):
+    node_id = int(node_id)
+    incidence = _node_incidence(guides, node_id)
+    degree = len(incidence)
+    if degree == 0:
+        raise GuideDeleteError(
+            "NODE_NOT_FOUND",
+            "The selected GuideNode no longer exists.",
+        )
+    if degree > 2:
+        raise GuideDeleteError(
+            "JUNCTION_CONFIRM_REQUIRED",
+            "A junction affects multiple branches; delete one edge or use a confirmed branch operation.",
+        )
+
+    if degree == 1:
+        guide_index, _endpoint = incidence[0]
+        removed_id = int(guides[guide_index].guide_id)
+        del guides[guide_index]
+        return GuideDeleteResult(
+            target_kind="END_NODE",
+            removed_guide_ids=(removed_id,),
+            removed_node_ids=(node_id,),
+            message="End node and its incident guide edge were removed.",
+        )
+
+    (left_index, left_endpoint), (right_index, right_endpoint) = incidence
+    if left_index == right_index:
+        raise GuideDeleteError(
+            "CLOSED_LOOP_NODE_PROTECTED",
+            "A closed-loop node cannot be collapsed as a degree-2 pass-through node.",
+        )
+    left_guide = guides[left_index]
+    right_guide = guides[right_index]
+    if int(left_guide.logical_side_id) != int(right_guide.logical_side_id):
+        raise GuideDeleteError(
+            "PROTECTED_CORNER",
+            "This degree-2 node separates two logical sides and is protected as a patch corner.",
+        )
+    if str(left_guide.source_kind) != str(right_guide.source_kind):
+        raise GuideDeleteError(
+            "INCOMPATIBLE_EDGE_OWNERSHIP",
+            "The two incident guide edges have incompatible ownership and cannot be merged safely.",
+        )
+
+    halves = []
+    for guide, endpoint in (
+        (left_guide, left_endpoint),
+        (right_guide, right_endpoint),
+    ):
+        outer_node, points, anchors, source_uids = _oriented_toward_node(
+            guide,
+            endpoint,
+        )
+        halves.append(
+            (
+                outer_node,
+                int(guide.guide_id),
+                points,
+                anchors,
+                source_uids,
+            )
+        )
+    halves.sort(key=lambda item: (item[0], item[1]))
+    first, second = halves
+    if first[0] == second[0]:
+        raise GuideDeleteError(
+            "PARALLEL_EDGE_NODE_PROTECTED",
+            "Collapsing this node would create a closed or duplicate guide edge.",
+        )
+
+    first_points = first[2]
+    second_points = list(reversed(second[2]))
+    merged_points = first_points + second_points[1:]
+    anchors_valid = (
+        len(first[3]) == len(first_points)
+        and len(second[3]) == len(second[2])
+    )
+    merged_anchors = ()
+    if anchors_valid:
+        merged_anchors = tuple(first[3]) + tuple(reversed(second[3]))[1:]
+    source_uids_valid = (
+        len(first[4]) == len(first_points)
+        and len(second[4]) == len(second[2])
+    )
+    merged_source_uids = ()
+    if source_uids_valid:
+        merged_source_uids = tuple(first[4]) + tuple(reversed(second[4]))[1:]
+
+    retained_id = min(int(left_guide.guide_id), int(right_guide.guide_id))
+    removed_id = max(int(left_guide.guide_id), int(right_guide.guide_id))
+    merged = GuidePath(
+        guide_id=retained_id,
+        points_local=merged_points,
+        start_node=int(first[0]),
+        end_node=int(second[0]),
+        logical_side_id=int(left_guide.logical_side_id),
+        source_kind=str(left_guide.source_kind),
+        source_vertex_uids=tuple(merged_source_uids),
+        anchors=tuple(merged_anchors),
+    )
+    insert_index = min(left_index, right_index)
+    for guide_index in sorted((left_index, right_index), reverse=True):
+        del guides[guide_index]
+    guides.insert(insert_index, merged)
+    return GuideDeleteResult(
+        target_kind="DEGREE_2_NODE",
+        changed_guide_ids=(retained_id,),
+        removed_guide_ids=(removed_id,),
+        removed_node_ids=(node_id,),
+        message="Degree-2 node merged into one resampled logical guide side.",
+    )
+
+
+def delete_guide_point(guides, guide_index, point_index):
+    guide_index = int(guide_index)
+    point_index = int(point_index)
+    if not (0 <= guide_index < len(guides)):
+        raise GuideDeleteError(
+            "GUIDE_NOT_FOUND",
+            "The selected guide no longer exists.",
+        )
+    guide = guides[guide_index]
+    if not (0 <= point_index < len(guide.points_local)):
+        raise GuideDeleteError(
+            "CONTROL_NOT_FOUND",
+            "The selected guide control no longer exists.",
+        )
+    if point_index == 0:
+        return delete_guide_node(guides, guide.start_node)
+    if point_index == len(guide.points_local) - 1:
+        return delete_guide_node(guides, guide.end_node)
+    return delete_guide_control(guides, guide.guide_id, point_index)
+
+
+def delete_guide_edge(guides, guide_id):
+    guide_index = _guide_index_for_id(guides, guide_id)
+    if guide_index is None:
+        raise GuideDeleteError(
+            "GUIDE_NOT_FOUND",
+            "The selected GuideEdge no longer exists.",
+        )
+    removed_id = int(guides[guide_index].guide_id)
+    del guides[guide_index]
+    return GuideDeleteResult(
+        target_kind="EDGE",
+        removed_guide_ids=(removed_id,),
+        message="Guide edge removed; dependent regions will be re-evaluated.",
+    )
 
 
 def split_guide(

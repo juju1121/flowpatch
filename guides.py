@@ -199,6 +199,14 @@ class GuideCommitResult:
     cell_record: dict
 
 
+@dataclass(frozen=True)
+class BuiltCellRemovalResult:
+    built_cells: dict
+    removed_cycle_keys: tuple
+    removed_faces: int
+    removed_vertices: int
+
+
 def _vector_payload(vector):
     return [round(float(component), 8) for component in vector]
 
@@ -586,6 +594,150 @@ def load_node_vertex_registry(obj):
 
 def save_node_vertex_registry(obj, registry):
     _save_json_mapping(obj, NODE_VERTEX_REGISTRY_KEY, registry)
+
+
+def _grid_face_uid_keys(record):
+    grid = tuple(
+        tuple(int(value) for value in row)
+        for row in record.get("grid_vertex_uids", ())
+    )
+    if len(grid) < 2 or any(len(row) < 2 for row in grid):
+        raise FlowPatchGeometryError(
+            "A built region has no stable GRID ownership map for deletion."
+        )
+    width = len(grid[0])
+    if any(len(row) != width for row in grid):
+        raise FlowPatchGeometryError(
+            "A built region has a malformed GRID ownership map."
+        )
+    face_keys = tuple(
+        frozenset(
+            (
+                grid[row_index][column_index],
+                grid[row_index][column_index + 1],
+                grid[row_index + 1][column_index + 1],
+                grid[row_index + 1][column_index],
+            )
+        )
+        for row_index in range(len(grid) - 1)
+        for column_index in range(width - 1)
+    )
+    if any(len(key) != 4 or any(uid <= 0 for uid in key) for key in face_keys):
+        raise FlowPatchGeometryError(
+            "A built region has collapsed or invalid GRID vertex ownership."
+        )
+    return face_keys
+
+
+def remove_built_cell_geometry(obj, bm, built_cells, cycle_keys):
+    selected_keys = tuple(sorted({str(value) for value in cycle_keys}))
+    if not selected_keys:
+        return BuiltCellRemovalResult(
+            built_cells=deepcopy(built_cells),
+            removed_cycle_keys=(),
+            removed_faces=0,
+            removed_vertices=0,
+        )
+
+    missing = [key for key in selected_keys if key not in built_cells]
+    if missing:
+        raise FlowPatchGeometryError(
+            "A selected built region no longer exists in the ownership registry."
+        )
+    uid_layer = bm.verts.layers.int.get(VERTEX_UID_LAYER)
+    if uid_layer is None:
+        raise FlowPatchGeometryError(
+            "Built-region deletion requires stable FlowPatch vertex UIDs."
+        )
+
+    face_keys = set()
+    candidate_uids = set()
+    for key in selected_keys:
+        record = built_cells[key]
+        if not isinstance(record, dict):
+            raise FlowPatchGeometryError(
+                "A selected built region has legacy ownership metadata."
+            )
+        record_face_keys = _grid_face_uid_keys(record)
+        if len(set(record_face_keys)) != len(record_face_keys):
+            raise FlowPatchGeometryError(
+                "A built region repeats GRID face ownership."
+            )
+        if face_keys.intersection(record_face_keys):
+            raise FlowPatchGeometryError(
+                "Built-region ownership overlaps and cannot be deleted atomically."
+            )
+        face_keys.update(record_face_keys)
+        for face_key in record_face_keys:
+            candidate_uids.update(face_key)
+        candidate_uids.update(
+            int(value) for value in record.get("vertex_uids", ())
+        )
+
+    matched_faces = []
+    for face in bm.faces:
+        if len(face.verts) != 4:
+            continue
+        key = frozenset(int(vert[uid_layer]) for vert in face.verts)
+        if key in face_keys:
+            matched_faces.append(face)
+    if len(matched_faces) != len(face_keys):
+        raise FlowPatchGeometryError(
+            "Built-region topology changed; deletion stopped before mutation."
+        )
+
+    bmesh.ops.delete(
+        bm,
+        geom=matched_faces,
+        context="FACES_ONLY",
+    )
+    orphaned = [
+        vert
+        for vert in bm.verts
+        if vert.is_valid
+        and int(vert[uid_layer]) in candidate_uids
+        and not vert.link_faces
+    ]
+    if orphaned:
+        bmesh.ops.delete(
+            bm,
+            geom=orphaned,
+            context="VERTS",
+        )
+
+    remaining_uids = {
+        int(vert[uid_layer])
+        for vert in bm.verts
+        if vert.is_valid and int(vert[uid_layer]) > 0
+    }
+    boundary_registry = {
+        key: record
+        for key, record in load_boundary_registry(obj).items()
+        if record.get("uids")
+        and all(int(uid) in remaining_uids for uid in record.get("uids", ()))
+    }
+    node_registry = {
+        key: int(uid)
+        for key, uid in load_node_vertex_registry(obj).items()
+        if int(uid) in remaining_uids
+    }
+    staged_cells = deepcopy(built_cells)
+    for key in selected_keys:
+        staged_cells.pop(key, None)
+    save_boundary_registry(obj, boundary_registry)
+    save_node_vertex_registry(obj, node_registry)
+    save_built_cells(obj, staged_cells)
+    bmesh.update_edit_mesh(
+        obj.data,
+        loop_triangles=True,
+        destructive=True,
+    )
+    return BuiltCellRemovalResult(
+        built_cells=staged_cells,
+        removed_cycle_keys=selected_keys,
+        removed_faces=len(matched_faces),
+        removed_vertices=len(orphaned),
+    )
 
 
 def guides_world(obj, guides):
@@ -4248,8 +4400,17 @@ def synchronize_mesh_from_guides(
             destructive=False,
         )
         _refresh_all_record_positions(staged, uid_map)
+        preview_by_key = {
+            str(preview.cycle_key): preview for preview in previews
+        }
         for cycle_key in selected_keys:
             record = staged[cycle_key]
+            _attach_control_bindings(
+                obj,
+                preview_by_key[cycle_key],
+                guides,
+                record,
+            )
             record["state"] = SYNC_PARAMETRIC
             record["sync_reason_code"] = "IN_SYNC"
             record["sync_message"] = (

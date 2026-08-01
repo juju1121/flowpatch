@@ -71,6 +71,7 @@ from .guides import load_built_cells
 from .guides import load_guides
 from .guides import NODE_VERTEX_REGISTRY_KEY
 from .guides import refresh_guide_surface_anchors
+from .guides import remove_built_cell_geometry
 from .guides import save_built_cells
 from .guides import save_guides
 from .guides import synchronize_guides_from_mesh
@@ -80,7 +81,10 @@ from .guides import VERTEX_UID_LAYER
 from .guides import _ensure_vertex_uids
 from .guide_graph import clone_guides
 from .guide_graph import connected_guide_indices
+from .guide_graph import delete_guide_edge
+from .guide_graph import delete_guide_point
 from .guide_graph import graph_nodes
+from .guide_graph import GuideDeleteError
 from .guide_graph import GuideGraphBudgetError
 from .guide_graph import GuidePath
 from .guide_graph import next_guide_id
@@ -4253,7 +4257,8 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._built_cells = sync_cells
         save_built_cells(self._retopo, self._built_cells)
         if self._history:
-            self._history.pop()
+            discarded = self._history.pop()
+            self._discard_state_snapshot(discarded)
 
     def _changed_guide_ids_from_snapshot(self, snapshot):
         before = {
@@ -4302,8 +4307,8 @@ class FLOWPATCH_OT_guide_session(Operator):
             self._built_cells = staged
         return tuple(sorted(changed))
 
-    def _state_snapshot(self):
-        return {
+    def _state_snapshot(self, include_mesh=False):
+        snapshot = {
             "guides": _clone_guides(self._guides),
             "u_segments": int(self._u_segments),
             "v_segments": int(self._v_segments),
@@ -4314,15 +4319,44 @@ class FLOWPATCH_OT_guide_session(Operator):
             "selected_points": tuple(sorted(self._selected_points or ())),
             "active_anchor": self._active_anchor,
         }
+        if include_mesh:
+            bm = bmesh.from_edit_mesh(self._retopo.data)
+            snapshot["_mesh_backup"] = _begin_auto_build_mesh_snapshot(bm)
+            snapshot["_flowpatch_properties"] = (
+                _capture_flowpatch_id_properties(self._retopo)
+            )
+        return snapshot
+
+    def _discard_state_snapshot(self, snapshot):
+        if isinstance(snapshot, dict):
+            _discard_auto_build_mesh_snapshot(snapshot.get("_mesh_backup"))
+
+    def _discard_history_stack(self, stack):
+        for snapshot in tuple(stack or ()):
+            self._discard_state_snapshot(snapshot)
+        if stack is not None:
+            stack.clear()
 
     def _push_history(self, clear_redo=True, snapshot=None):
-        self._history.append(snapshot or self._state_snapshot())
+        self._history.append(
+            snapshot if snapshot is not None else self._state_snapshot()
+        )
         if len(self._history) > 32:
-            del self._history[0]
+            discarded = self._history.pop(0)
+            self._discard_state_snapshot(discarded)
         if clear_redo:
-            self._redo_history.clear()
+            self._discard_history_stack(self._redo_history)
 
     def _restore_state(self, snapshot, rebuild=True):
+        mesh_backup = snapshot.get("_mesh_backup")
+        if mesh_backup is not None:
+            bm = bmesh.from_edit_mesh(self._retopo.data)
+            _restore_auto_build_mesh_snapshot(
+                self._retopo,
+                bm,
+                mesh_backup,
+                snapshot.get("_flowpatch_properties", {}),
+            )
         self._guides = _clone_guides(snapshot["guides"])
         self._u_segments = int(snapshot["u_segments"])
         self._v_segments = int(snapshot["v_segments"])
@@ -4343,15 +4377,35 @@ class FLOWPATCH_OT_guide_session(Operator):
     def _undo_guide_edit(self):
         if not self._history:
             return False
-        self._redo_history.append(self._state_snapshot())
-        self._restore_state(self._history.pop())
+        snapshot = self._history.pop()
+        redo_snapshot = self._state_snapshot(
+            include_mesh="_mesh_backup" in snapshot
+        )
+        try:
+            self._restore_state(snapshot)
+        except Exception:
+            self._discard_state_snapshot(redo_snapshot)
+            self._history.append(snapshot)
+            raise
+        self._redo_history.append(redo_snapshot)
+        self._discard_state_snapshot(snapshot)
         return True
 
     def _redo_guide_edit(self):
         if not self._redo_history:
             return False
-        self._history.append(self._state_snapshot())
-        self._restore_state(self._redo_history.pop())
+        snapshot = self._redo_history.pop()
+        undo_snapshot = self._state_snapshot(
+            include_mesh="_mesh_backup" in snapshot
+        )
+        try:
+            self._restore_state(snapshot)
+        except Exception:
+            self._discard_state_snapshot(undo_snapshot)
+            self._redo_history.append(snapshot)
+            raise
+        self._history.append(undo_snapshot)
+        self._discard_state_snapshot(snapshot)
         return True
 
     def _resolve_target(self, context):
@@ -4655,6 +4709,24 @@ class FLOWPATCH_OT_guide_session(Operator):
             self._active_anchor = None
         return True
 
+    def _select_guide_edge_index(self, guide_index, *, shift=False):
+        guide_index = int(guide_index)
+        if not (0 <= guide_index < len(self._guides)):
+            return False
+        selected = set(self._selected_guides or ())
+        if shift:
+            if guide_index in selected:
+                selected.remove(guide_index)
+            else:
+                selected.add(guide_index)
+        else:
+            selected = {guide_index}
+        self._selected_guides = selected
+        self._selected_points = set()
+        self._selected_control = None
+        self._active_anchor = None
+        return True
+
     def _clear_selection(self):
         self._selected_control = None
         self._selected_guides = set()
@@ -4887,10 +4959,10 @@ class FLOWPATCH_OT_guide_session(Operator):
                 ("selected_editable_guides",),
             ),
             "DELETE": when(
-                has_guides,
-                "GUIDES_REQUIRED",
-                "No editable guide exists.",
-                ("retained_guide",),
+                has_guide_selection,
+                "EXACT_GUIDE_SELECTION_REQUIRED",
+                "Select one guide control, node, or edge before deleting.",
+                ("selected_guide_element",),
             ),
             "MIRROR": available(state="EXPERIMENTAL"),
             "CONTROL_POINTS": available(),
@@ -5028,7 +5100,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             _toolbar_item(
                 "DELETE",
                 "11_delete_cell.png",
-                "Delete Guide: delete the selected editable guide, or the newest guide",
+                "Delete Guide: remove the exact selected control, node, or edge",
                 enabled=capability("DELETE").enabled,
                 disabled_reason=capability("DELETE").message,
             ),
@@ -5974,43 +6046,190 @@ class FLOWPATCH_OT_guide_session(Operator):
             return
         self._rebuild_previews()
 
-    def _delete_guide(self):
+    def _selected_delete_target(self):
+        if (
+            self._selected_guides
+            and not self._selected_points
+            and self._selected_control is None
+        ):
+            if len(self._selected_guides) != 1:
+                raise GuideDeleteError(
+                    "MULTIPLE_EDGE_SELECTION",
+                    "Select exactly one GuideEdge before deleting.",
+                )
+            guide_index = next(iter(self._selected_guides))
+            if not (0 <= guide_index < len(self._guides)):
+                raise GuideDeleteError(
+                    "GUIDE_NOT_FOUND",
+                    "The selected GuideEdge no longer exists.",
+                )
+            return "EDGE", int(guide_index), -1
+
+        if self._selected_control is None:
+            raise GuideDeleteError(
+                "EXACT_SELECTION_REQUIRED",
+                "Select one guide control, node, or edge before deleting.",
+            )
+        active = (
+            int(self._selected_control[0]),
+            int(self._selected_control[1]),
+        )
+        equivalent_refs = self._expand_shared_endpoint_refs(active)
+        selected_refs = set(self._selected_points or (active,))
+        if not selected_refs or not selected_refs.issubset(equivalent_refs):
+            raise GuideDeleteError(
+                "MULTIPLE_POINT_SELECTION",
+                "Select exactly one guide control or one canonical node before deleting.",
+            )
+        return "POINT", active[0], active[1]
+
+    def _built_cell_keys_for_guides(self, guide_ids):
+        guide_ids = {int(value) for value in guide_ids}
+        return tuple(
+            sorted(
+                str(cycle_key)
+                for cycle_key, record in self._built_cells.items()
+                if isinstance(record, dict)
+                and str(record.get("state", "")).upper() != SYNC_DETACHED
+                and guide_ids.intersection(
+                    int(value) for value in record.get("edge_ids", ())
+                )
+            )
+        )
+
+    def _delete_guide(self, context):
         if not self._guides:
             self.report({"WARNING"}, "There are no guides to delete.")
-            return
-        guide_indices = (
-            list(self._selection_guide_indices())
-            if self._selected_guides
-            else [
-                self._selected_control[0]
-                if self._selected_control is not None
-                else len(self._guides) - 1
-            ]
-        )
+            return False
+        try:
+            target_kind, guide_index, point_index = (
+                self._selected_delete_target()
+            )
+        except GuideDeleteError as exc:
+            self.report({"WARNING"}, str(exc))
+            return False
+
+        staged_guides = clone_guides(self._guides)
+        try:
+            if target_kind == "EDGE":
+                guide_id = int(self._guides[guide_index].guide_id)
+                owner_keys = self._built_cell_keys_for_guides((guide_id,))
+                if len(owner_keys) > 1:
+                    raise GuideDeleteError(
+                        "SHARED_INTERIOR_EDGE_REQUIRES_REFLOW",
+                        "This GuideEdge is shared by built regions; use Dissolve/Reflow.",
+                    )
+                result = delete_guide_edge(staged_guides, guide_id)
+            else:
+                result = delete_guide_point(
+                    staged_guides,
+                    guide_index,
+                    point_index,
+                )
+        except GuideDeleteError as exc:
+            SESSION_BREADCRUMBS.record(
+                "guide_delete_rejected",
+                reason_code=exc.reason_code,
+                message=str(exc),
+            )
+            self.report({"WARNING"}, str(exc))
+            return False
+
+        affected_guide_ids = set(result.affected_guide_ids)
         if any(
-            self._guide_is_locked(self._guides[index].guide_id)
-            for index in guide_indices
+            self._guide_is_locked(guide.guide_id)
+            for guide in self._guides
+            if int(guide.guide_id) in affected_guide_ids
         ):
             self.report(
                 {"WARNING"},
                 "A selected guide belongs to a frozen built region; use Sync.",
             )
-            return
-        deleted_guide_ids = {
-            int(self._guides[index].guide_id)
-            for index in guide_indices
-        }
-        self._push_history()
-        for guide_index in sorted(set(guide_indices), reverse=True):
-            del self._guides[guide_index]
-        self._clear_selection()
-        save_guides(self._retopo, self._guides)
-        self._freeze_cells_for_guides(
-            deleted_guide_ids,
-            "GUIDE_TOPOLOGY_CHANGED",
-            "A guide owned by this built region was deleted.",
+            return False
+
+        affected_cell_keys = self._built_cell_keys_for_guides(
+            affected_guide_ids
         )
-        self._rebuild_previews()
+        try:
+            snapshot = self._state_snapshot(include_mesh=True)
+        except Exception as exc:
+            self.report(
+                {"ERROR"},
+                f"Delete stopped before mutation: rollback snapshot failed: {exc}",
+            )
+            return False
+        self._push_history(snapshot=snapshot)
+        try:
+            self._guides = staged_guides
+            save_guides(self._retopo, self._guides)
+            if result.target_kind == "CONTROL":
+                if self._sync_mesh_from_current_guides(
+                    changed_guide_ids=result.changed_guide_ids,
+                ) is None:
+                    raise FlowPatchGeometryError(
+                        "The affected built region could not synchronize after control deletion."
+                    )
+            else:
+                if affected_cell_keys:
+                    bm = bmesh.from_edit_mesh(self._retopo.data)
+                    removal = remove_built_cell_geometry(
+                        self._retopo,
+                        bm,
+                        self._built_cells,
+                        affected_cell_keys,
+                    )
+                    self._built_cells = removal.built_cells
+                if not self._rebuild_previews():
+                    raise FlowPatchGeometryError(
+                        "Guide deletion exceeded the safe region-rebuild budget."
+                    )
+                changed_ids = {int(value) for value in result.changed_guide_ids}
+                rebuild_keys = tuple(
+                    str(preview.cycle_key)
+                    for preview in self._previews
+                    if str(preview.validation_status).upper() == "VALID"
+                    and changed_ids.intersection(
+                        int(value) for value in preview.edge_ids
+                    )
+                )
+                if rebuild_keys and not self._commit_ready_cells(
+                    context,
+                    cycle_keys=rebuild_keys,
+                    auto_build=True,
+                    preserve_history=True,
+                ):
+                    raise FlowPatchGeometryError(
+                        "A valid affected region could not be rebuilt after deletion."
+                    )
+            self._clear_selection()
+            if not self._rebuild_previews():
+                raise FlowPatchGeometryError(
+                    "Guide deletion could not refresh the affected region preview."
+                )
+        except Exception as exc:
+            try:
+                self._restore_state(snapshot)
+            finally:
+                if self._history and self._history[-1] is snapshot:
+                    self._history.pop()
+                self._discard_state_snapshot(snapshot)
+            SESSION_BREADCRUMBS.record(
+                "guide_delete_rolled_back",
+                target_kind=result.target_kind,
+                message=str(exc),
+            )
+            self.report({"ERROR"}, f"Delete rolled back: {exc}")
+            return False
+
+        SESSION_BREADCRUMBS.record(
+            "guide_delete_committed",
+            target_kind=result.target_kind,
+            changed_guide_ids=result.changed_guide_ids,
+            removed_guide_ids=result.removed_guide_ids,
+            affected_cell_keys=affected_cell_keys,
+        )
+        self.report({"INFO"}, result.message)
+        return True
 
     def _adjust_density(self, axis, delta, push_history=True):
         if push_history:
@@ -6130,6 +6349,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         dissolve=False,
         cycle_keys=None,
         auto_build=False,
+        preserve_history=False,
     ):
         if not self._previews:
             self.report(
@@ -6322,8 +6542,9 @@ class FLOWPATCH_OT_guide_session(Operator):
         finally:
             _discard_auto_build_mesh_snapshot(rollback_mesh)
 
-        self._history.clear()
-        self._redo_history.clear()
+        if not preserve_history:
+            self._discard_history_stack(self._history)
+            self._discard_history_stack(self._redo_history)
         try:
             bpy.ops.ed.undo_push(
                 message=(
@@ -6459,7 +6680,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             self._relax_guides(context)
             return "KEEP"
         if action == "DELETE":
-            self._delete_guide()
+            self._delete_guide(context)
             return "KEEP"
         if action == "MIRROR":
             settings = self._scene.flowpatch_retopo
@@ -6498,6 +6719,8 @@ class FLOWPATCH_OT_guide_session(Operator):
             _pen_reset(self)
         if self._transform_mode:
             self._rollback_transform_state(rebuild=False)
+        self._discard_history_stack(getattr(self, "_history", None))
+        self._discard_history_stack(getattr(self, "_redo_history", None))
         self._clear_hover_feedback("SESSION_CLEANUP")
         self._session_alive = False
         self._stroke_snap_press = None
@@ -6922,9 +7145,9 @@ class FLOWPATCH_OT_guide_session(Operator):
                 return {"RUNNING_MODAL"}
             return {"PASS_THROUGH"}
 
-        if event.type == "BACK_SPACE" and event.value == "PRESS":
+        if event.type in {"BACK_SPACE", "DEL", "X"} and event.value == "PRESS":
             self._exit_armed = False
-            self._delete_guide()
+            self._delete_guide(context)
             return {"RUNNING_MODAL"}
 
         if event.type in {"RET", "NUMPAD_ENTER"} and event.value == "PRESS":
@@ -7049,6 +7272,19 @@ class FLOWPATCH_OT_guide_session(Operator):
                 selected = self._nearest_control(mouse)
                 self._exit_armed = False
                 if selected is None:
+                    edge_hit = (
+                        self._nearest_guide_segment(mouse, radius_px=11.0)
+                        if not event.ctrl
+                        else None
+                    )
+                    if edge_hit is not None:
+                        self._select_guide_edge_index(
+                            edge_hit["guide_index"],
+                            shift=event.shift,
+                        )
+                        self._mode = "EDIT"
+                        self._update_renderer()
+                        return {"RUNNING_MODAL"}
                     if not event.shift and not event.ctrl:
                         self._clear_selection()
                     self._update_renderer()
