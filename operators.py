@@ -2627,6 +2627,45 @@ class FLOWPATCH_OT_start_session(Operator):
         return {"FINISHED"}
 
 
+def _stop_active_session(context, *, leave_edit_mode):
+    """Finalize the owned modal session without relying on another operator poll."""
+    session_class = globals().get("FLOWPATCH_OT_guide_session")
+    session = (
+        getattr(session_class, "_active_instance", None)
+        if session_class is not None
+        else None
+    )
+    if session is None:
+        return False, False
+
+    retopo = safe_rna_attr(session, "_retopo", None)
+    SESSION_BREADCRUMBS.record(
+        "session_stop_requested",
+        session_epoch=_safe_int(getattr(session, "_session_epoch", 0)),
+        context_mode=str(getattr(context, "mode", "")),
+        retopo_object=_object_name(retopo),
+    )
+    session._finalize_session(context, commit_pending=False)
+
+    left_edit_mode = False
+    if (
+        leave_edit_mode
+        and _edit_mesh_poll(context)
+        and context.edit_object is retopo
+    ):
+        result = bpy.ops.object.mode_set(mode="OBJECT")
+        left_edit_mode = (
+            "FINISHED" in result
+            and str(getattr(context, "mode", "")) == "OBJECT"
+        )
+    if retopo is not None:
+        try:
+            retopo["flowpatch_session_active"] = False
+        except Exception:
+            pass
+    return True, left_edit_mode
+
+
 class FLOWPATCH_OT_stop_session(Operator):
     bl_idname = "flowpatch.stop_session"
     bl_label = "Stop FlowPatch Session"
@@ -2637,16 +2676,35 @@ class FLOWPATCH_OT_stop_session(Operator):
 
     @classmethod
     def poll(cls, context):
-        return _edit_mesh_poll(context)
+        session_class = globals().get("FLOWPATCH_OT_guide_session")
+        return bool(
+            session_class is not None
+            and getattr(session_class, "_active_instance", None) is not None
+        )
 
     def execute(self, context):
-        session = FLOWPATCH_OT_guide_session._active_instance
-        if session is not None:
-            session._finalize_session(context, commit_pending=False)
-        retopo = context.edit_object
-        bpy.ops.object.mode_set(mode="OBJECT")
-        if retopo is not None:
-            retopo["flowpatch_session_active"] = False
+        try:
+            stopped, left_edit_mode = _stop_active_session(
+                context,
+                leave_edit_mode=True,
+            )
+        except Exception as exc:
+            SESSION_BREADCRUMBS.record(
+                "session_stop_failed",
+                error_type=type(exc).__name__,
+                message=str(exc),
+            )
+            self.report({"ERROR"}, f"FlowPatch could not stop safely: {exc}")
+            return {"CANCELLED"}
+        if not stopped:
+            self.report({"WARNING"}, "No active FlowPatch session is available to stop.")
+            return {"CANCELLED"}
+        if not left_edit_mode and _edit_mesh_poll(context):
+            self.report(
+                {"INFO"},
+                "FlowPatch session stopped; current Edit Mode was left unchanged.",
+            )
+            return {"FINISHED"}
         self.report({"INFO"}, "FlowPatch session stopped; geometry was preserved.")
         return {"FINISHED"}
 
@@ -7245,12 +7303,25 @@ class FLOWPATCH_OT_toggle_tool(Operator):
     def invoke(self, context, _event):
         active_session = FLOWPATCH_OT_guide_session._active_instance
         if active_session is not None:
-            result = bpy.ops.flowpatch.stop_session("EXEC_DEFAULT")
-            return (
-                {"FINISHED"}
-                if "FINISHED" in result
-                else {"CANCELLED"}
-            )
+            try:
+                stopped, _left_edit_mode = _stop_active_session(
+                    context,
+                    leave_edit_mode=True,
+                )
+            except Exception as exc:
+                SESSION_BREADCRUMBS.record(
+                    "session_stop_failed",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    launch="F7",
+                )
+                self.report({"ERROR"}, f"FlowPatch could not stop safely: {exc}")
+                return {"CANCELLED"}
+            if not stopped:
+                self.report({"WARNING"}, "No active FlowPatch session is available to stop.")
+                return {"CANCELLED"}
+            self.report({"INFO"}, "FlowPatch session stopped; geometry was preserved.")
+            return {"FINISHED"}
 
         if context.mode == "EDIT_MESH":
             try:

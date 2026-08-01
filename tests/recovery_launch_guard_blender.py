@@ -193,6 +193,72 @@ assert reporter.messages == [
     }
 ]
 
+
+class ActiveSessionCapture:
+    def __init__(self, retopo_object):
+        self._retopo = retopo_object
+        self._session_epoch = 41
+        self.calls = []
+
+    def _finalize_session(self, context, commit_pending=False):
+        self.calls.append(
+            {
+                "context_mode": context.mode,
+                "commit_pending": bool(commit_pending),
+            }
+        )
+        operators.FLOWPATCH_OT_guide_session._active_instance = None
+
+
+bpy.ops.object.mode_set(mode="OBJECT")
+f7_stop_session = ActiveSessionCapture(plain_retopo)
+operators.FLOWPATCH_OT_guide_session._active_instance = f7_stop_session
+f7_stop_reporter = ReportCapture()
+f7_stop_result = operators.FLOWPATCH_OT_toggle_tool.invoke(
+    f7_stop_reporter,
+    bpy.context,
+    None,
+)
+assert f7_stop_result == {"FINISHED"}
+assert f7_stop_session.calls == [
+    {
+        "context_mode": "OBJECT",
+        "commit_pending": False,
+    }
+]
+assert bpy.context.mode == "OBJECT"
+assert operators.FLOWPATCH_OT_guide_session._active_instance is None
+assert f7_stop_reporter.messages == [
+    {
+        "levels": ["INFO"],
+        "message": "FlowPatch session stopped; geometry was preserved.",
+    }
+]
+
+panel_stop_session = ActiveSessionCapture(plain_retopo)
+operators.FLOWPATCH_OT_guide_session._active_instance = panel_stop_session
+assert operators.FLOWPATCH_OT_stop_session.poll(bpy.context)
+panel_stop_reporter = ReportCapture()
+panel_stop_result = operators.FLOWPATCH_OT_stop_session.execute(
+    panel_stop_reporter,
+    bpy.context,
+)
+assert panel_stop_result == {"FINISHED"}
+assert panel_stop_session.calls == [
+    {
+        "context_mode": "OBJECT",
+        "commit_pending": False,
+    }
+]
+assert bpy.context.mode == "OBJECT"
+assert operators.FLOWPATCH_OT_guide_session._active_instance is None
+assert panel_stop_reporter.messages == [
+    {
+        "levels": ["INFO"],
+        "message": "FlowPatch session stopped; geometry was preserved.",
+    }
+]
+
 evidence = {
     "status": "passed",
     "version": list(flowpatch_retopo.bl_info["version"]),
@@ -207,6 +273,10 @@ evidence = {
     "retopo_preserved": plain_retopo.name,
     "flowpatch_properties_unchanged": properties_after == properties_before,
     "session_started": settings.session_active,
+    "f7_object_mode_stop_result": sorted(f7_stop_result),
+    "f7_object_mode_stop_finalize_calls": f7_stop_session.calls,
+    "panel_object_mode_stop_result": sorted(panel_stop_result),
+    "panel_object_mode_stop_finalize_calls": panel_stop_session.calls,
 }
 run_dir = Path(args.run_dir)
 run_dir.mkdir(parents=True, exist_ok=True)

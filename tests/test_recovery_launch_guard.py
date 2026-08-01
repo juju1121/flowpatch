@@ -241,7 +241,7 @@ class PenStateTests(unittest.TestCase):
             )
         )
 
-    def test_f7_stop_routes_through_object_mode_session_stop(self):
+    def test_f7_stop_uses_owned_cleanup_without_nested_operator_poll(self):
         source = OPERATORS_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         toggle_class = next(
@@ -257,7 +257,8 @@ class PenStateTests(unittest.TestCase):
             and node.name == "invoke"
         )
         invoke_source = ast.get_source_segment(source, invoke)
-        self.assertIn(
+        self.assertIn("_stop_active_session(", invoke_source)
+        self.assertNotIn(
             'bpy.ops.flowpatch.stop_session("EXEC_DEFAULT")',
             invoke_source,
         )
@@ -265,6 +266,25 @@ class PenStateTests(unittest.TestCase):
             "active_session._finalize_session",
             invoke_source,
         )
+
+    def test_stop_session_poll_accepts_an_active_object_mode_session(self):
+        source = OPERATORS_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        stop_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "FLOWPATCH_OT_stop_session"
+        )
+        poll = next(
+            node
+            for node in stop_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "poll"
+        )
+        poll_source = ast.get_source_segment(source, poll)
+        self.assertIn("_active_instance", poll_source)
+        self.assertNotIn("_edit_mesh_poll", poll_source)
 
     def test_f7_start_preflights_edit_mode_surface(self):
         source = OPERATORS_PATH.read_text(encoding="utf-8")
