@@ -121,7 +121,7 @@ class DiagnosticsPureTests(unittest.TestCase):
         self.assertEqual(decoded["warnings"], ["project object missing"])
 
     def test_build_identity_is_complete_and_versioned(self):
-        self.assertEqual(build_identity.ADDON_VERSION, (1, 4, 16))
+        self.assertEqual(build_identity.ADDON_VERSION, (1, 4, 17))
         self.assertTrue(build_identity.BUILD_ID.startswith("recovery-p1-"))
         self.assertRegex(
             build_identity.PACKAGE_PAYLOAD_SHA256,
@@ -131,8 +131,8 @@ class DiagnosticsPureTests(unittest.TestCase):
         manifest = (ROOT / "blender_manifest.toml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('"version": (1, 4, 16)', init_source)
-        self.assertIn('version = "1.4.16"', manifest)
+        self.assertIn('"version": (1, 4, 17)', init_source)
+        self.assertIn('version = "1.4.17"', manifest)
 
     def test_payload_hash_matches_canonical_runtime_files(self):
         runtime_files = sorted(

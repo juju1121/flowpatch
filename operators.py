@@ -4374,9 +4374,9 @@ class FLOWPATCH_OT_guide_session(Operator):
             self._region_3d,
             mouse,
             target_object_uuid=target_uuid,
-            previous_anchor=(
-                self._stroke_anchors[-1] if self._stroke_anchors else None
-            ),
+            # This is a visibility probe only. The candidate loop below
+            # validates every committed sample against the prior anchor.
+            previous_anchor=None,
             surface_offset=settings.surface_offset,
             frontface_epsilon=settings.frontface_epsilon,
             max_surface_step=settings.max_surface_step,
@@ -4392,6 +4392,10 @@ class FLOWPATCH_OT_guide_session(Operator):
                     sample_count=_safe_count(
                         getattr(self, "_stroke_world", None)
                     ),
+                )
+                self._set_status(
+                    context,
+                    "FlowPatch needs a front-facing hit on the locked Surface.",
                 )
             _pen_projection_miss(self)
             return False

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "flowpatch_retopo"
-version = "1.4.16"
+version = "1.4.17"
 name = "FlowPatch Retopo"
 tagline = "Build editable quad patches from retained surface guides"
 maintainer = "Independent clean-room implementation"

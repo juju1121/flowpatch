@@ -79,6 +79,18 @@ class SurfaceAnchorStaticTests(unittest.TestCase):
         self.assertGreater(reprojection_index, filter_index)
         self.assertIn("self._stroke_anchors = final_anchors", source)
 
+    def test_draw_sampling_probes_endpoint_before_anchor_continuity(self):
+        start = self.operators.index("def _append_surface_sample(")
+        end = self.operators.index("previous_event_mouse =", start)
+        source = self.operators[start:end]
+        self.assertIn("# This is a visibility probe only.", source)
+        self.assertIn("previous_anchor=None", source)
+        self.assertIn("front-facing hit on the locked Surface", source)
+
+    def test_active_session_locks_visible_surface_picker(self):
+        self.assertIn("surface.enabled = not settings.session_active", self.ui)
+        self.assertIn("Surface is locked while drawing.", self.ui)
+
     def test_preview_reports_and_enforces_planar_metrics(self):
         for metric in (
             "patch_max_plane_deviation",

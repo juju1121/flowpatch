@@ -209,7 +209,14 @@ class VIEW3D_PT_flowpatch_retopo(Panel):
             text="Stop" if settings.session_active else "Start",
             icon="CANCEL" if settings.session_active else "PLAY",
         )
-        session.prop(settings, "target", text="Surface")
+        surface = session.row()
+        surface.enabled = not settings.session_active
+        surface.prop(settings, "target", text="Surface")
+        if settings.session_active:
+            session.label(
+                text="Surface is locked while drawing. Stop to change it.",
+                icon="LOCKED",
+            )
         project_uuid = str(
             edit_object.get("flowpatch_project_uuid_v1", "")
         )
