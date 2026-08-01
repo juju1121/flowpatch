@@ -41,6 +41,7 @@ project_objects_for_target = MODULE.project_objects_for_target
 repair_passive_target_uuid_copies = (
     MODULE.repair_passive_target_uuid_copies
 )
+repair_active_project_copy = MODULE.repair_active_project_copy
 read_project_record = MODULE.read_project_record
 write_project_record = MODULE.write_project_record
 
@@ -237,6 +238,59 @@ class ProjectStoreTests(unittest.TestCase):
             audit_projects((target, retopo, clone_a, clone_b)),
             (),
         )
+
+    def test_active_retopo_copy_gets_an_independent_project_domain(self):
+        target = owner("Target")
+        original = owner("Original")
+        values = iter(UUIDS)
+        original_record = bind_project(
+            target,
+            original,
+            uuid_factory=values.__next__,
+        )
+        copied = deepcopy(original)
+        copied["name"] = "Copied"
+        original_before = deepcopy(original)
+
+        repaired, copied_from = repair_active_project_copy(
+            (target, original, copied),
+            target,
+            copied,
+            uuid_factory=values.__next__,
+        )
+
+        self.assertEqual(copied_from, ("Original",))
+        self.assertEqual(
+            repaired.target_object_uuid,
+            original_record.target_object_uuid,
+        )
+        self.assertNotEqual(
+            repaired.retopo_object_uuid,
+            original_record.retopo_object_uuid,
+        )
+        self.assertNotEqual(repaired.project_uuid, original_record.project_uuid)
+        self.assertEqual(original, original_before)
+        self.assertEqual(read_project_record(copied), repaired)
+
+    def test_active_copy_repair_rolls_back_malformed_generated_identity(self):
+        target = owner("Target")
+        original = owner("Original")
+        values = iter(UUIDS)
+        bind_project(target, original, uuid_factory=values.__next__)
+        copied = deepcopy(original)
+        copied["name"] = "Copied"
+        copied_before = deepcopy(copied)
+        generated = iter((UUIDS[3], "not-a-uuid"))
+
+        with self.assertRaises(ProjectStoreError):
+            repair_active_project_copy(
+                (target, original, copied),
+                target,
+                copied,
+                uuid_factory=generated.__next__,
+            )
+
+        self.assertEqual(copied, copied_before)
 
     def test_project_bearing_uuid_copy_fails_without_mutation(self):
         target = owner("Target")

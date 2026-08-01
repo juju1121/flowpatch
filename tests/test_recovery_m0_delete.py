@@ -103,17 +103,17 @@ class GuideDeleteStaticTests(unittest.TestCase):
 
     def test_package_identity_is_unique_for_m0(self):
         self.assertIn(
-            '"version": (1, 4, 19)',
+            '"version": (1, 4, 20)',
             INIT_PATH.read_text(encoding="utf-8"),
         )
         self.assertIn(
-            'version = "1.4.19"',
+            'version = "1.4.20"',
             MANIFEST_PATH.read_text(encoding="utf-8"),
         )
         build_identity = BUILD_IDENTITY_PATH.read_text(encoding="utf-8")
-        self.assertIn('ADDON_VERSION = (1, 4, 19)', build_identity)
+        self.assertIn('ADDON_VERSION = (1, 4, 20)', build_identity)
         self.assertIn(
-            'BUILD_ID = "recovery-r1-guide-interaction-20260801"',
+            'BUILD_ID = "recovery-pf02-binding-registry-20260801"',
             build_identity,
         )
 

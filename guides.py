@@ -8,6 +8,8 @@ import bmesh
 from mathutils import Vector
 from mathutils.geometry import tessellate_polygon
 
+from .binding_registry import retire_region_bindings
+from .binding_registry import sync_guide_identities
 from .geometry import EDGE_ROLE_RAIL
 from .geometry import EDGE_ROLE_SPOKE
 from .geometry import FlowPatchGeometryError
@@ -472,6 +474,7 @@ def save_guides(obj, guides):
         ],
     }
     obj[GUIDE_DATA_KEY] = json.dumps(payload, separators=(",", ":"))
+    sync_guide_identities(obj, guides)
 
 
 def load_built_cells(obj):
@@ -724,6 +727,7 @@ def remove_built_cell_geometry(obj, bm, built_cells, cycle_keys):
     staged_cells = deepcopy(built_cells)
     for key in selected_keys:
         staged_cells.pop(key, None)
+    retire_region_bindings(obj, bm, selected_keys)
     save_boundary_registry(obj, boundary_registry)
     save_node_vertex_registry(obj, node_registry)
     save_built_cells(obj, staged_cells)

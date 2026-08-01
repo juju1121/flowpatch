@@ -362,6 +362,7 @@ def build_debug_document(
     breadcrumbs=None,
     build_identity=None,
     project_state=None,
+    binding_state=None,
     warnings=None,
     last_exception=None,
 ):
@@ -377,6 +378,7 @@ def build_debug_document(
             project_state.get("target_object_found", False)
         ),
         "project": _json_safe(project_state),
+        "binding_audit": _json_safe(binding_state or {}),
         "warnings": _json_safe(list(warnings or ())),
         "last_exception": _json_safe(last_exception),
         "context": _json_safe(context_state or {}),

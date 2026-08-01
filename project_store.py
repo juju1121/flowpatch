@@ -651,6 +651,76 @@ def repair_passive_target_uuid_copies(objects, preferred_target, project_owner):
     return tuple(_object_name(owner) for owner in passive)
 
 
+def repair_active_project_copy(
+    objects,
+    target,
+    retopo,
+    uuid_factory=new_uuid,
+):
+    """Give an explicitly active copied retopo object its own project domain."""
+    owners = tuple(objects)
+    record = read_project_record(retopo)
+    if record is None:
+        return None, ()
+
+    copied_from = tuple(
+        sorted(
+            {
+                _object_name(owner)
+                for owner in owners
+                if owner is not retopo
+                and (
+                    owner.get(OBJECT_UUID_KEY, "")
+                    == record.retopo_object_uuid
+                    or owner.get(PROJECT_UUID_KEY, "")
+                    == record.project_uuid
+                )
+            }
+        )
+    )
+    if not copied_from:
+        return record, ()
+
+    target_uuid = _canonical_uuid(
+        target.get(OBJECT_UUID_KEY, ""),
+        "MISSING_TARGET_UUID",
+        f"Configured Surface UUID on {_object_name(target)}",
+    )
+    if target_uuid != record.target_object_uuid:
+        raise ProjectStoreError(
+            "COPIED_PROJECT_TARGET_MISMATCH",
+            "The copied FlowPatch project no longer resolves its recorded Surface.",
+        )
+
+    snapshot = _snapshot_owner_keys(
+        retopo,
+        (OBJECT_UUID_KEY, PROJECT_UUID_KEY, PROJECT_RECORD_KEY),
+    )
+    try:
+        retopo_uuid = _canonical_uuid(
+            uuid_factory(),
+            "MALFORMED_GENERATED_UUID",
+            "Copied retopo object UUID",
+        )
+        project_uuid = _canonical_uuid(
+            uuid_factory(),
+            "MALFORMED_GENERATED_UUID",
+            "Copied project UUID",
+        )
+        retopo[OBJECT_UUID_KEY] = retopo_uuid
+        repaired = ProjectRecord(
+            project_uuid=project_uuid,
+            schema_version=PROJECT_SCHEMA_VERSION,
+            target_object_uuid=record.target_object_uuid,
+            retopo_object_uuid=retopo_uuid,
+        )
+        write_project_record(retopo, repaired, allow_replace=True)
+    except Exception:
+        _restore_owner_keys(retopo, snapshot)
+        raise
+    return repaired, copied_from
+
+
 def project_objects_for_target(objects, target_uuid):
     wanted = _canonical_uuid(
         target_uuid,

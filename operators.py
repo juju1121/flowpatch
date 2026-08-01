@@ -13,6 +13,30 @@ from bpy.types import Operator
 from mathutils import Matrix
 from mathutils import Vector
 
+from .binding_registry import audit_binding_registry_object
+from .binding_registry import BINDING_REGISTRY_KEY
+from .binding_registry import BindingRegistryError
+from .binding_registry import ensure_binding_registry
+from .binding_registry import FP_ANCHOR_LOCAL_ID
+from .binding_registry import FP_CELL_LOCAL_ID
+from .binding_registry import FP_EDGE_BOUNDARY_KEY
+from .binding_registry import FP_EDGE_GENERATION
+from .binding_registry import FP_EDGE_REGION
+from .binding_registry import FP_EDGE_ROLE
+from .binding_registry import FP_EDGE_UID
+from .binding_registry import FP_FACE_GENERATION
+from .binding_registry import FP_FACE_REGION
+from .binding_registry import FP_FACE_UID
+from .binding_registry import FP_GUIDE_EDGE_LOCAL_ID
+from .binding_registry import FP_GUIDE_NODE_LOCAL_ID
+from .binding_registry import FP_PARAM_U
+from .binding_registry import FP_PARAM_V
+from .binding_registry import FP_SOLVER_KIND
+from .binding_registry import FP_VERTEX_GENERATION
+from .binding_registry import FP_VERTEX_REGION
+from .binding_registry import FP_VERTEX_ROLE
+from .binding_registry import FP_VERTEX_UID
+from .binding_registry import record_committed_regions
 from .build_identity import ADDON_VERSION_STRING
 from .build_identity import BUILD_ID
 from .build_identity import PACKAGE_PAYLOAD_HASH_SCOPE
@@ -120,6 +144,7 @@ from .project_store import PROJECT_SCHEMA_VERSION
 from .project_store import PROJECT_UUID_KEY
 from .project_store import ProjectStoreError
 from .project_store import project_objects_for_target
+from .project_store import repair_active_project_copy
 from .project_store import repair_passive_target_uuid_copies
 from .project_store import read_composite_session
 from .project_store import read_project_record
@@ -147,6 +172,20 @@ _SNAP_HARD_MAX_PX = 22.0
 _MAX_STROKE_SAMPLES = 4096
 _SESSION_EPOCH = 0
 _LAST_PROJECT_AUDIT = audit_snapshot(())
+_LAST_BINDING_AUDIT = {
+    "binding_schema_version": 0,
+    "migration_state": "NO_PROJECT_OBJECT",
+    "region_count": 0,
+    "bound_vertex_count": 0,
+    "bound_edge_count": 0,
+    "bound_face_count": 0,
+    "duplicate_uid_count": 0,
+    "missing_element_count": 0,
+    "orphan_element_count": 0,
+    "shared_boundary_mismatch_count": 0,
+    "issue_count": 0,
+    "issues": [],
+}
 _LAST_SESSION_IDENTITY = {
     "project_uuid": "",
     "retopo_object_uuid": "",
@@ -1670,6 +1709,7 @@ def _session_debug_state(
         return {
             "active": False,
             "project_audit": deepcopy(_LAST_PROJECT_AUDIT),
+            "binding_audit": deepcopy(_LAST_BINDING_AUDIT),
             "composite": _composite_debug_state(scene),
             "identity": {
                 "project_uuid": project_state.get("project_uuid", ""),
@@ -1781,6 +1821,7 @@ def _session_debug_state(
             ),
         },
         "project_audit": deepcopy(_LAST_PROJECT_AUDIT),
+        "binding_audit": deepcopy(_LAST_BINDING_AUDIT),
         "identity": _identity_from_session(session),
         "retopo_object": project_state.get("retopo_object", {}).get(
             "object_name",
@@ -1807,6 +1848,45 @@ def _clear_hover_snap(owner, reason_code=""):
         owner._tag_redraw()
     except (AttributeError, RuntimeError):
         pass
+
+
+def _binding_debug_state(context, session):
+    obj = safe_rna_attr(session, "_retopo", None)
+    if obj is None:
+        try:
+            obj = _context_project_object(context)
+        except Exception:
+            obj = None
+    if obj is None:
+        return deepcopy(_LAST_BINDING_AUDIT)
+    try:
+        guides = (
+            tuple(getattr(session, "_guides", None) or ())
+            if session is not None
+            else tuple(load_guides(obj))
+        )
+        return audit_binding_registry_object(obj, guides=guides)
+    except Exception as exc:
+        return {
+            "binding_schema_version": 0,
+            "migration_state": "AUDIT_FAILED",
+            "region_count": 0,
+            "bound_vertex_count": 0,
+            "bound_edge_count": 0,
+            "bound_face_count": 0,
+            "duplicate_uid_count": 0,
+            "missing_element_count": 0,
+            "orphan_element_count": 0,
+            "shared_boundary_mismatch_count": 0,
+            "issue_count": 1,
+            "issues": [
+                {
+                    "reason_code": "BINDING_AUDIT_FAILED",
+                    "message": str(exc),
+                    "region_uuid": "",
+                }
+            ],
+        }
 
 
 def build_debug_state_snapshot(context=None):
@@ -1844,6 +1924,7 @@ def build_debug_state_snapshot(context=None):
             or ""
         ),
     }
+    binding_state = _binding_debug_state(context, session)
     return build_debug_document(
         session_state=_session_debug_state(
             session,
@@ -1855,6 +1936,7 @@ def build_debug_state_snapshot(context=None):
         breadcrumbs=SESSION_BREADCRUMBS,
         build_identity=_build_identity_state(),
         project_state=project_state,
+        binding_state=binding_state,
         warnings=warnings,
         last_exception=_last_exception_snapshot(),
     )
@@ -1952,6 +2034,7 @@ _SESSION_START_OWNER_KEYS = (
     OBJECT_UUID_KEY,
     PROJECT_UUID_KEY,
     PROJECT_RECORD_KEY,
+    BINDING_REGISTRY_KEY,
     "flowpatch_target_name",
     "flowpatch_session_active",
 )
@@ -2725,6 +2808,7 @@ _PROJECT_OBJECT_DATA_KEYS = (
     BOUNDARY_REGISTRY_KEY,
     NODE_VERTEX_REGISTRY_KEY,
     VERTEX_UID_COUNTER_KEY,
+    BINDING_REGISTRY_KEY,
     "flowpatch_target_name",
     "flowpatch_session_active",
 )
@@ -2749,6 +2833,25 @@ _PROJECT_MESH_ATTRIBUTE_NAMES = (
     EDGE_LAYER_NAME,
     EDGE_ROLE_LAYER_NAME,
     FACE_LAYER_NAME,
+    FP_VERTEX_UID,
+    FP_VERTEX_REGION,
+    FP_VERTEX_ROLE,
+    FP_VERTEX_GENERATION,
+    FP_GUIDE_NODE_LOCAL_ID,
+    FP_ANCHOR_LOCAL_ID,
+    FP_PARAM_U,
+    FP_PARAM_V,
+    FP_EDGE_UID,
+    FP_EDGE_REGION,
+    FP_EDGE_BOUNDARY_KEY,
+    FP_EDGE_GENERATION,
+    FP_GUIDE_EDGE_LOCAL_ID,
+    FP_EDGE_ROLE,
+    FP_FACE_UID,
+    FP_FACE_REGION,
+    FP_CELL_LOCAL_ID,
+    FP_SOLVER_KIND,
+    FP_FACE_GENERATION,
 )
 
 
@@ -4325,6 +4428,10 @@ class FLOWPATCH_OT_guide_session(Operator):
             "selected_points": tuple(sorted(self._selected_points or ())),
             "selected_segment": self._selected_segment,
             "active_anchor": self._active_anchor,
+            "_binding_registry_property": (
+                BINDING_REGISTRY_KEY in self._retopo,
+                deepcopy(self._retopo.get(BINDING_REGISTRY_KEY, "")),
+            ),
         }
         if include_mesh:
             bm = bmesh.from_edit_mesh(self._retopo.data)
@@ -4364,6 +4471,14 @@ class FLOWPATCH_OT_guide_session(Operator):
                 mesh_backup,
                 snapshot.get("_flowpatch_properties", {}),
             )
+        binding_existed, binding_raw = snapshot.get(
+            "_binding_registry_property",
+            (False, ""),
+        )
+        if binding_existed:
+            self._retopo[BINDING_REGISTRY_KEY] = deepcopy(binding_raw)
+        elif BINDING_REGISTRY_KEY in self._retopo:
+            del self._retopo[BINDING_REGISTRY_KEY]
         self._guides = _clone_guides(snapshot["guides"])
         self._u_segments = int(snapshot["u_segments"])
         self._v_segments = int(snapshot["v_segments"])
@@ -6613,6 +6728,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         auto_build=False,
         preserve_history=False,
     ):
+        global _LAST_BINDING_AUDIT
         if not self._previews:
             self.report(
                 {"WARNING"},
@@ -6687,37 +6803,38 @@ class FLOWPATCH_OT_guide_session(Operator):
         rollback_properties = None
         rollback_runtime = None
         settings = context.scene.flowpatch_retopo
-        if auto_build:
-            try:
-                rollback_mesh = _begin_auto_build_mesh_snapshot(bm)
-                rollback_properties = _capture_flowpatch_id_properties(
-                    self._retopo
-                )
-                rollback_runtime = {
-                    "built_cells": deepcopy(self._built_cells),
-                    "density_overrides": deepcopy(self._density_overrides),
-                    "previews": list(self._previews),
-                    "active_preview_index": int(self._active_preview_index),
-                    "validation_errors": list(self._validation_errors),
-                    "last_preview_warning": str(self._last_preview_warning),
-                    "u_segments": int(settings.u_segments),
-                    "v_segments": int(settings.v_segments),
-                    "last_patch_id": int(settings.last_patch_id),
-                    "last_effective_rows": int(
-                        settings.last_effective_rows
-                    ),
-                }
-            except Exception as exc:
-                _discard_auto_build_mesh_snapshot(rollback_mesh)
-                self.report(
-                    {"ERROR"},
-                    f"Auto Build deferred; use Build Patch to retry: {exc}",
-                )
-                SESSION_BREADCRUMBS.record(
-                    "auto_build_snapshot_rejected",
-                    message=str(exc),
-                )
-                return False
+        try:
+            rollback_mesh = _begin_auto_build_mesh_snapshot(bm)
+            rollback_properties = _capture_flowpatch_id_properties(
+                self._retopo
+            )
+            rollback_runtime = {
+                "built_cells": deepcopy(self._built_cells),
+                "density_overrides": deepcopy(self._density_overrides),
+                "previews": list(self._previews),
+                "active_preview_index": int(self._active_preview_index),
+                "validation_errors": list(self._validation_errors),
+                "last_preview_warning": str(self._last_preview_warning),
+                "u_segments": int(settings.u_segments),
+                "v_segments": int(settings.v_segments),
+                "last_patch_id": int(settings.last_patch_id),
+                "last_effective_rows": int(
+                    settings.last_effective_rows
+                ),
+                "binding_audit": deepcopy(_LAST_BINDING_AUDIT),
+            }
+        except Exception as exc:
+            _discard_auto_build_mesh_snapshot(rollback_mesh)
+            self.report(
+                {"ERROR"},
+                f"Build deferred; rollback snapshot failed: {exc}",
+            )
+            SESSION_BREADCRUMBS.record(
+                "build_snapshot_rejected",
+                build_kind="AUTO" if auto_build else "MANUAL",
+                message=str(exc),
+            )
+            return False
         try:
             components = self._preview_components(selected_previews)
             results = commit_guide_patches(
@@ -6736,6 +6853,25 @@ class FLOWPATCH_OT_guide_session(Operator):
                 results,
                 components,
             )
+            project_record = read_project_record(self._retopo)
+            if project_record is None:
+                raise BindingRegistryError(
+                    "BINDING_REGION_MISSING",
+                    "Build lost its FlowPatch project identity.",
+                )
+            _registry, binding_audit = record_committed_regions(
+                self._retopo,
+                bm,
+                project_record,
+                self._guides,
+                results,
+            )
+            _LAST_BINDING_AUDIT = deepcopy(binding_audit)
+            bmesh.update_edit_mesh(
+                self._retopo.data,
+                loop_triangles=True,
+                destructive=False,
+            )
             updated_built_cells = deepcopy(self._built_cells)
             updated_density_overrides = deepcopy(self._density_overrides)
             for result in results:
@@ -6753,46 +6889,46 @@ class FLOWPATCH_OT_guide_session(Operator):
             if rebuild:
                 self._rebuild_previews()
         except Exception as exc:
-            if auto_build:
-                try:
-                    _restore_auto_build_mesh_snapshot(
-                        self._retopo,
-                        bm,
-                        rollback_mesh,
-                        rollback_properties,
-                    )
-                    self._built_cells = rollback_runtime["built_cells"]
-                    self._density_overrides = rollback_runtime[
-                        "density_overrides"
-                    ]
-                    self._previews = rollback_runtime["previews"]
-                    self._active_preview_index = rollback_runtime[
-                        "active_preview_index"
-                    ]
-                    self._validation_errors = rollback_runtime[
-                        "validation_errors"
-                    ]
-                    self._last_preview_warning = rollback_runtime[
-                        "last_preview_warning"
-                    ]
-                    settings.u_segments = rollback_runtime["u_segments"]
-                    settings.v_segments = rollback_runtime["v_segments"]
-                    settings.last_patch_id = rollback_runtime["last_patch_id"]
-                    settings.last_effective_rows = rollback_runtime[
-                        "last_effective_rows"
-                    ]
-                    self._update_renderer()
-                except Exception as rollback_exc:
-                    SESSION_BREADCRUMBS.record(
-                        "auto_build_rollback_failed",
-                        message=str(rollback_exc),
-                    )
-                    raise RuntimeError(
-                        "Auto Build failed and its rollback could not "
-                        "restore the exact prior state."
-                    ) from rollback_exc
-            elif not isinstance(exc, FlowPatchGeometryError):
-                raise
+            try:
+                _restore_auto_build_mesh_snapshot(
+                    self._retopo,
+                    bm,
+                    rollback_mesh,
+                    rollback_properties,
+                )
+                self._built_cells = rollback_runtime["built_cells"]
+                self._density_overrides = rollback_runtime[
+                    "density_overrides"
+                ]
+                self._previews = rollback_runtime["previews"]
+                self._active_preview_index = rollback_runtime[
+                    "active_preview_index"
+                ]
+                self._validation_errors = rollback_runtime[
+                    "validation_errors"
+                ]
+                self._last_preview_warning = rollback_runtime[
+                    "last_preview_warning"
+                ]
+                settings.u_segments = rollback_runtime["u_segments"]
+                settings.v_segments = rollback_runtime["v_segments"]
+                settings.last_patch_id = rollback_runtime["last_patch_id"]
+                settings.last_effective_rows = rollback_runtime[
+                    "last_effective_rows"
+                ]
+                _LAST_BINDING_AUDIT = deepcopy(
+                    rollback_runtime["binding_audit"]
+                )
+                self._update_renderer()
+            except Exception as rollback_exc:
+                SESSION_BREADCRUMBS.record(
+                    "build_rollback_failed",
+                    message=str(rollback_exc),
+                )
+                raise RuntimeError(
+                    "Build failed and its rollback could not restore the exact "
+                    "prior state."
+                ) from rollback_exc
             self.report({"ERROR"}, str(exc))
             SESSION_BREADCRUMBS.record(
                 "build_failed",
@@ -7056,6 +7192,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         _pen_reset(self)
 
     def invoke(self, context, event):
+        global _LAST_BINDING_AUDIT
         global _SESSION_EPOCH
         active_instance = self.__class__._active_instance
         SESSION_BREADCRUMBS.record(
@@ -7082,6 +7219,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._retopo_object_name_hint = _object_name(self._retopo)
         self._target_object_uuid = ""
         self._target_object_name_hint = ""
+        self._binding_project_rekeyed = False
         try:
             self._target = self._resolve_target(context)
         except ProjectStoreError as exc:
@@ -7122,6 +7260,27 @@ class FLOWPATCH_OT_guide_session(Operator):
             )
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        try:
+            project_record, copied_from = repair_active_project_copy(
+                tuple(bpy.data.objects),
+                self._target,
+                self._retopo,
+            )
+        except ProjectStoreError as exc:
+            SESSION_BREADCRUMBS.record(
+                "project_copy_repair_rejected",
+                reason_code=exc.reason_code,
+                message=str(exc),
+            )
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self._binding_project_rekeyed = bool(copied_from)
+        if copied_from:
+            SESSION_BREADCRUMBS.record(
+                "project_copy_rekeyed",
+                copied_from=tuple(copied_from),
+                project_uuid=project_record.project_uuid,
+            )
         _remember_session_identity(
             self,
             project_record,
@@ -7144,6 +7303,8 @@ class FLOWPATCH_OT_guide_session(Operator):
             )
             self.report({"ERROR"}, "A 3D Viewport window region is required.")
             return {"CANCELLED"}
+        binding_backup = None
+        binding_properties = None
         try:
             self._retopo.show_in_front = True
             self._projector = SurfaceProjector(
@@ -7152,6 +7313,25 @@ class FLOWPATCH_OT_guide_session(Operator):
             )
             self._guides = load_guides(self._retopo)
             self._built_cells = load_built_cells(self._retopo)
+            binding_bm = bmesh.from_edit_mesh(self._retopo.data)
+            binding_backup = _begin_auto_build_mesh_snapshot(binding_bm)
+            binding_properties = _capture_flowpatch_id_properties(
+                self._retopo
+            )
+            _registry, binding_audit = ensure_binding_registry(
+                self._retopo,
+                binding_bm,
+                project_record,
+                self._guides,
+                self._built_cells,
+                allow_project_rekey=self._binding_project_rekeyed,
+            )
+            bmesh.update_edit_mesh(
+                self._retopo.data,
+                loop_triangles=True,
+                destructive=False,
+            )
+            _LAST_BINDING_AUDIT = deepcopy(binding_audit)
             self._density_overrides = {}
             self._previews = []
             self._stroke_world = []
@@ -7244,8 +7424,28 @@ class FLOWPATCH_OT_guide_session(Operator):
                 toolbar_ids=TOOL_REGISTRY.ids,
             )
             self._tag_redraw()
+            _discard_auto_build_mesh_snapshot(binding_backup)
+            binding_backup = None
             return {"RUNNING_MODAL"}
         except Exception as exc:
+            if binding_backup is not None:
+                try:
+                    rollback_bm = bmesh.from_edit_mesh(self._retopo.data)
+                    _restore_auto_build_mesh_snapshot(
+                        self._retopo,
+                        rollback_bm,
+                        binding_backup,
+                        binding_properties or {},
+                    )
+                except Exception as rollback_exc:
+                    SESSION_BREADCRUMBS.record(
+                        "binding_start_rollback_failed",
+                        error_type=type(rollback_exc).__name__,
+                        message=str(rollback_exc),
+                    )
+                finally:
+                    _discard_auto_build_mesh_snapshot(binding_backup)
+                    binding_backup = None
             SESSION_BREADCRUMBS.record(
                 "session_start_failed",
                 error_type=type(exc).__name__,
