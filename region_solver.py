@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from itertools import combinations
 from math import isfinite
 from math import sqrt
 
@@ -23,6 +24,164 @@ class WindingDecision:
             "signed_area": float(self.signed_area),
             "point_count": int(self.point_count),
         }
+
+
+def _point2(value):
+    try:
+        point = (float(value[0]), float(value[1]))
+    except (IndexError, TypeError, ValueError):
+        return None
+    return point if all(isfinite(component) for component in point) else None
+
+
+def _distance2(left, right):
+    return sqrt(
+        (left[0] - right[0]) ** 2 + (left[1] - right[1]) ** 2
+    )
+
+
+def _point_segment_distance2(point, start, end):
+    direction = (end[0] - start[0], end[1] - start[1])
+    length_squared = direction[0] ** 2 + direction[1] ** 2
+    if length_squared <= 1.0e-12:
+        return _distance2(point, start)
+    factor = max(
+        0.0,
+        min(
+            1.0,
+            (
+                (point[0] - start[0]) * direction[0]
+                + (point[1] - start[1]) * direction[1]
+            )
+            / length_squared,
+        ),
+    )
+    closest = (
+        start[0] + direction[0] * factor,
+        start[1] + direction[1] * factor,
+    )
+    return _distance2(point, closest)
+
+
+def infer_closed_quad_corner_indices(
+    points,
+    close_tolerance=18.0,
+    minimum_turn_score=0.18,
+    maximum_side_deviation=0.14,
+):
+    """Return four stable source indices for an obvious closed quadrilateral."""
+    cleaned = []
+    source_indices = []
+    for source_index, value in enumerate(tuple(points or ())):
+        point = _point2(value)
+        if point is None:
+            return ()
+        if cleaned and _distance2(point, cleaned[-1]) <= 1.0e-6:
+            continue
+        cleaned.append(point)
+        source_indices.append(source_index)
+    if len(cleaned) < 5:
+        return ()
+    if _distance2(cleaned[0], cleaned[-1]) > max(
+        1.0e-6,
+        float(close_tolerance),
+    ):
+        return ()
+    cleaned.pop()
+    source_indices.pop()
+    count = len(cleaned)
+    if count < 4:
+        return ()
+    if count == 4:
+        return tuple(source_indices)
+
+    lengths = [
+        _distance2(cleaned[index], cleaned[(index + 1) % count])
+        for index in range(count)
+    ]
+    perimeter = sum(lengths)
+    if perimeter <= 1.0e-6:
+        return ()
+    scores = []
+    for index in range(count):
+        previous = cleaned[(index - 1) % count]
+        current = cleaned[index]
+        following = cleaned[(index + 1) % count]
+        incoming = (current[0] - previous[0], current[1] - previous[1])
+        outgoing = (following[0] - current[0], following[1] - current[1])
+        incoming_length = sqrt(incoming[0] ** 2 + incoming[1] ** 2)
+        outgoing_length = sqrt(outgoing[0] ** 2 + outgoing[1] ** 2)
+        if incoming_length <= 1.0e-8 or outgoing_length <= 1.0e-8:
+            scores.append(0.0)
+            continue
+        cosine = max(
+            -1.0,
+            min(
+                1.0,
+                (
+                    incoming[0] * outgoing[0]
+                    + incoming[1] * outgoing[1]
+                )
+                / (incoming_length * outgoing_length),
+            ),
+        )
+        scores.append(1.0 - cosine)
+
+    candidates = [
+        index
+        for index, score in enumerate(scores)
+        if score >= float(minimum_turn_score)
+    ]
+    candidates = sorted(
+        candidates,
+        key=lambda index: (-scores[index], index),
+    )[:16]
+    if len(candidates) < 4:
+        return ()
+
+    def forward_indices(start, end):
+        values = [start]
+        current = start
+        while current != end:
+            current = (current + 1) % count
+            values.append(current)
+        return values
+
+    best = None
+    for chosen in combinations(sorted(candidates), 4):
+        arc_lengths = []
+        max_ratio = 0.0
+        valid = True
+        for start, end in zip(chosen, chosen[1:] + chosen[:1]):
+            indices = forward_indices(start, end)
+            arc_length = sum(lengths[index] for index in indices[:-1])
+            arc_lengths.append(arc_length)
+            chord = _distance2(cleaned[start], cleaned[end])
+            if chord <= perimeter * 0.04:
+                valid = False
+                break
+            deviation = max(
+                (
+                    _point_segment_distance2(
+                        cleaned[index],
+                        cleaned[start],
+                        cleaned[end],
+                    )
+                    for index in indices[1:-1]
+                ),
+                default=0.0,
+            )
+            max_ratio = max(max_ratio, deviation / chord)
+        if not valid or min(arc_lengths) < perimeter * 0.08:
+            continue
+        if max_ratio > float(maximum_side_deviation):
+            continue
+        rank = (sum(scores[index] for index in chosen), -max_ratio)
+        if best is None or rank > best[0]:
+            best = (rank, chosen)
+    if best is None:
+        return ()
+    return tuple(source_indices[index] for index in best[1])
 
 
 def bounded_face_signature(edge_ids):

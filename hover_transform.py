@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 
 _TRANSFORM_MODES = {"MOVE", "ROTATE", "SCALE"}
-_HOVER_KINDS = {"CANONICAL_NODE", "GUIDE_EDGE"}
+_HOVER_KINDS = {"CANONICAL_NODE", "GUIDE_CONTROL", "GUIDE_EDGE"}
 
 
 def _normalize_refs(refs):
@@ -65,7 +65,7 @@ def resolve_hover_transform(
             message="Hover a guide node or edge, then press G, R, or S.",
         )
 
-    if hover_kind == "CANONICAL_NODE" and mode != "MOVE":
+    if hover_kind in {"CANONICAL_NODE", "GUIDE_CONTROL"} and mode != "MOVE":
         return HoverTransformDecision(
             False,
             mode,

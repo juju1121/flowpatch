@@ -25,8 +25,12 @@ if args.addon_root not in sys.path:
 from flowpatch_retopo.guide_graph import delete_guide_edge
 from flowpatch_retopo.guide_graph import delete_guide_node
 from flowpatch_retopo.guide_graph import delete_guide_point
+from flowpatch_retopo.guide_graph import delete_guide_segment
+from flowpatch_retopo.guide_graph import find_four_sided_cycles
 from flowpatch_retopo.guide_graph import GuideDeleteError
 from flowpatch_retopo.guide_graph import GuidePath
+from flowpatch_retopo.guide_graph import insert_guide_control
+from flowpatch_retopo.guide_graph import split_closed_guide_into_sides
 from flowpatch_retopo.guide_graph import SurfaceAnchor
 from flowpatch_retopo.guides import load_boundary_registry
 from flowpatch_retopo.guides import load_node_vertex_registry
@@ -37,6 +41,7 @@ from flowpatch_retopo.guides import save_built_cells
 from flowpatch_retopo.guides import save_guides
 from flowpatch_retopo.guides import save_node_vertex_registry
 from flowpatch_retopo.guides import VERTEX_UID_LAYER
+from flowpatch_retopo import operators as operators_module
 from flowpatch_retopo.operators import FLOWPATCH_OT_guide_session
 
 
@@ -106,18 +111,86 @@ evidence["degree_2_merge"] = {
     "removed": result.removed_guide_ids,
 }
 
-protected = [
+corner = [
     guide(10, ((0, 0, 0), (1, 0, 0)), 31, 32, 40),
     guide(11, ((1, 0, 0), (2, 0, 0)), 32, 33, 41),
 ]
-try:
-    delete_guide_node(protected, 32)
-except GuideDeleteError as exc:
-    assert exc.reason_code == "PROTECTED_CORNER"
-else:
-    raise AssertionError("A logical patch corner was collapsed.")
-assert len(protected) == 2
-evidence["protected_corner"] = "rejected"
+result = delete_guide_node(corner, 32)
+assert result.target_kind == "DEGREE_2_NODE"
+assert len(corner) == 1
+assert corner[0].logical_side_id == 40
+evidence["explicit_corner_delete"] = "merged"
+
+inserted = [guide(12, ((0, 0, 0), (2, 0, 0)), 34, 35, 42)]
+guide_index, point_index = insert_guide_control(
+    inserted,
+    12,
+    0,
+    0.5,
+    Vector((1, 0, 0)),
+)
+assert (guide_index, point_index) == (0, 1)
+assert tuple(point.x for point in inserted[0].points_local) == (0.0, 1.0, 2.0)
+assert len(inserted[0].anchors) == 3
+assert inserted[0].source_vertex_uids == ()
+evidence["hover_insert"] = "one_control"
+
+segment_guides = [
+    guide(
+        13,
+        ((0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)),
+        36,
+        37,
+        43,
+    )
+]
+result = delete_guide_segment(segment_guides, 13, 1)
+assert result.target_kind == "SEGMENT"
+assert len(segment_guides) == 2
+assert segment_guides[0].end_node != segment_guides[1].start_node
+assert tuple(point.x for point in segment_guides[0].points_local) == (0.0, 1.0)
+assert tuple(point.x for point in segment_guides[1].points_local) == (2.0, 3.0)
+evidence["segment_delete"] = "two_open_fragments"
+
+first_segment = [
+    guide(14, ((0, 0, 0), (1, 0, 0), (2, 0, 0)), 38, 39, 44)
+]
+delete_guide_segment(first_segment, 14, 0)
+assert len(first_segment) == 1
+assert first_segment[0].start_node not in {38, 39}
+assert first_segment[0].end_node == 39
+
+last_segment = [
+    guide(15, ((0, 0, 0), (1, 0, 0), (2, 0, 0)), 40, 41, 45)
+]
+delete_guide_segment(last_segment, 15, 1)
+assert len(last_segment) == 1
+assert last_segment[0].start_node == 40
+assert last_segment[0].end_node not in {40, 41}
+evidence["endpoint_segment_delete"] = "new_endpoint_ids"
+
+closed = [
+    guide(
+        16,
+        (
+            (0, 0, 0),
+            (2, 0, 0),
+            (2, 2, 0),
+            (0, 2, 0),
+            (0, 0, 0),
+        ),
+        50,
+        50,
+        46,
+    )
+]
+side_ids = split_closed_guide_into_sides(closed, 16, (0, 1, 2, 3))
+assert len(side_ids) == 4
+assert len(closed) == 4
+cycles, _edge_nodes, _by_id = find_four_sided_cycles(closed)
+assert len(cycles) == 1
+assert len(cycles[0].sides) == 4
+evidence["closed_quad_split"] = side_ids
 
 junction = [
     guide(20, ((0, 0, 0), (1, 0, 0)), 41, 42, 50),
@@ -240,6 +313,7 @@ owner = SimpleNamespace(
     _selected_control=(0, 0),
     _selected_guides=set(),
     _selected_points={(0, 0)},
+    _selected_segment=None,
     _active_anchor=(0, 0),
     _scene=None,
     _sync_scene_settings=lambda: None,
@@ -262,6 +336,55 @@ assert (bm.verts[0].co - original_coordinate).length <= 1.0e-8
 assert obj["flowpatch_m0_marker"] == "before"
 FLOWPATCH_OT_guide_session._discard_state_snapshot(owner, snapshot)
 evidence["mesh_undo_snapshot"] = "restored"
+
+auto_snapshot = {
+    "guides": [],
+    "u_segments": 1,
+    "v_segments": 1,
+    "built_cells": {},
+    "density_overrides": {},
+    "selected_control": None,
+    "selected_guides": (),
+    "selected_points": (),
+    "selected_segment": None,
+    "active_anchor": None,
+}
+commit_args = {}
+auto_owner = SimpleNamespace(
+    _previews=(SimpleNamespace(cycle_key="quad"),),
+    _built_cells={},
+    _history=[auto_snapshot],
+    _retopo=obj,
+    report=lambda *_args, **_kwargs: None,
+)
+
+
+def fake_commit(_context, **kwargs):
+    commit_args.update(kwargs)
+    return True
+
+
+auto_owner._commit_ready_cells = fake_commit
+original_plan_auto_build = operators_module.plan_auto_build
+operators_module.plan_auto_build = lambda *_args, **_kwargs: SimpleNamespace(
+    cycle_keys=("quad",),
+    skipped=(),
+)
+try:
+    committed = FLOWPATCH_OT_guide_session._auto_build_new_previews(
+        auto_owner,
+        bpy.context,
+        (),
+    )
+finally:
+    operators_module.plan_auto_build = original_plan_auto_build
+assert committed == 1
+assert "_mesh_backup" in auto_snapshot
+assert "_flowpatch_properties" in auto_snapshot
+assert commit_args["auto_build"] is True
+assert commit_args["preserve_history"] is True
+FLOWPATCH_OT_guide_session._discard_state_snapshot(auto_owner, auto_snapshot)
+evidence["auto_build_local_undo"] = "mesh_backed_history_preserved"
 
 run_dir = Path(args.run_dir)
 run_dir.mkdir(parents=True, exist_ok=True)

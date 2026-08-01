@@ -337,6 +337,63 @@ def _without_index(values, index):
     return tuple(value for value_index, value in enumerate(values) if value_index != index)
 
 
+def insert_guide_control(
+    guides,
+    guide_id,
+    segment_index,
+    factor,
+    point_local,
+    anchor=None,
+):
+    guide_index = _guide_index_for_id(guides, guide_id)
+    if guide_index is None:
+        raise GuideDeleteError(
+            "GUIDE_NOT_FOUND",
+            "The hovered guide no longer exists.",
+        )
+    guide = guides[guide_index]
+    segment_index = int(segment_index)
+    if not (0 <= segment_index < len(guide.points_local) - 1):
+        raise GuideDeleteError(
+            "SEGMENT_NOT_FOUND",
+            "The hovered guide segment no longer exists.",
+        )
+    factor = max(0.0, min(1.0, float(factor)))
+    if factor <= 1.0e-5:
+        return guide_index, segment_index
+    if factor >= 1.0 - 1.0e-5:
+        return guide_index, segment_index + 1
+
+    point_count = len(guide.points_local)
+    insert_index = segment_index + 1
+    guide.points_local.insert(insert_index, Vector(point_local).copy())
+    if len(guide.anchors) == point_count:
+        try:
+            inserted_anchor = (
+                anchor.copy()
+                if anchor is not None
+                else guide.anchors[segment_index].interpolated(
+                    guide.anchors[segment_index + 1],
+                    factor,
+                )
+            )
+        except (AttributeError, ValueError):
+            guide.anchors = ()
+        else:
+            guide.anchors = (
+                guide.anchors[:insert_index]
+                + (inserted_anchor,)
+                + guide.anchors[insert_index:]
+            )
+    elif guide.anchors:
+        guide.anchors = ()
+    if guide.source_vertex_uids:
+        # An inserted control has no existing mesh-vertex identity. Keeping the
+        # old UID tuple would falsely claim a direct boundary ownership map.
+        guide.source_vertex_uids = ()
+    return guide_index, insert_index
+
+
 def delete_guide_control(guides, guide_id, point_index):
     guide_index = _guide_index_for_id(guides, guide_id)
     if guide_index is None:
@@ -430,17 +487,31 @@ def delete_guide_node(guides, node_id):
 
     (left_index, left_endpoint), (right_index, right_endpoint) = incidence
     if left_index == right_index:
-        raise GuideDeleteError(
-            "CLOSED_LOOP_NODE_PROTECTED",
-            "A closed-loop node cannot be collapsed as a degree-2 pass-through node.",
+        guide = guides[left_index]
+        ring = [point.copy() for point in guide.points_local[:-1]]
+        if len(ring) <= 3:
+            raise GuideDeleteError(
+                "MINIMUM_CLOSED_LOOP",
+                "A closed guide needs at least three controls after deletion.",
+            )
+        guide.points_local = ring[1:] + [ring[1].copy()]
+        if len(guide.anchors) == len(ring) + 1:
+            ring_anchors = tuple(anchor.copy() for anchor in guide.anchors[:-1])
+            guide.anchors = ring_anchors[1:] + (ring_anchors[1].copy(),)
+        elif guide.anchors:
+            guide.anchors = ()
+        if len(guide.source_vertex_uids) == len(ring) + 1:
+            ring_uids = tuple(int(value) for value in guide.source_vertex_uids[:-1])
+            guide.source_vertex_uids = ring_uids[1:] + (ring_uids[1],)
+        elif guide.source_vertex_uids:
+            guide.source_vertex_uids = ()
+        return GuideDeleteResult(
+            target_kind="CLOSED_LOOP_CONTROL",
+            changed_guide_ids=(int(guide.guide_id),),
+            message="Closed-loop control removed; the loop remains closed.",
         )
     left_guide = guides[left_index]
     right_guide = guides[right_index]
-    if int(left_guide.logical_side_id) != int(right_guide.logical_side_id):
-        raise GuideDeleteError(
-            "PROTECTED_CORNER",
-            "This degree-2 node separates two logical sides and is protected as a patch corner.",
-        )
     if str(left_guide.source_kind) != str(right_guide.source_kind):
         raise GuideDeleteError(
             "INCOMPATIBLE_EDGE_OWNERSHIP",
@@ -498,7 +569,10 @@ def delete_guide_node(guides, node_id):
         points_local=merged_points,
         start_node=int(first[0]),
         end_node=int(second[0]),
-        logical_side_id=int(left_guide.logical_side_id),
+        logical_side_id=min(
+            int(left_guide.logical_side_id),
+            int(right_guide.logical_side_id),
+        ),
         source_kind=str(left_guide.source_kind),
         source_vertex_uids=tuple(merged_source_uids),
         anchors=tuple(merged_anchors),
@@ -512,7 +586,7 @@ def delete_guide_node(guides, node_id):
         changed_guide_ids=(retained_id,),
         removed_guide_ids=(removed_id,),
         removed_node_ids=(node_id,),
-        message="Degree-2 node merged into one resampled logical guide side.",
+        message="Degree-2 node removed; its incident guide edges were merged.",
     )
 
 
@@ -551,6 +625,189 @@ def delete_guide_edge(guides, guide_id):
         removed_guide_ids=(removed_id,),
         message="Guide edge removed; dependent regions will be re-evaluated.",
     )
+
+
+def delete_guide_segment(guides, guide_id, segment_index):
+    guide_index = _guide_index_for_id(guides, guide_id)
+    if guide_index is None:
+        raise GuideDeleteError(
+            "GUIDE_NOT_FOUND",
+            "The selected guide no longer exists.",
+        )
+    guide = guides[guide_index]
+    segment_index = int(segment_index)
+    segment_count = len(guide.points_local) - 1
+    if not (0 <= segment_index < segment_count):
+        raise GuideDeleteError(
+            "SEGMENT_NOT_FOUND",
+            "The selected guide segment no longer exists.",
+        )
+    if segment_count == 1:
+        return delete_guide_edge(guides, guide_id)
+
+    point_count = len(guide.points_local)
+    anchors_valid = len(guide.anchors) == point_count
+    source_valid = len(guide.source_vertex_uids) == point_count
+    retained_id = int(guide.guide_id)
+
+    if int(guide.start_node) == int(guide.end_node):
+        ring_points = [point.copy() for point in guide.points_local[:-1]]
+        ring_anchors = tuple(anchor.copy() for anchor in guide.anchors[:-1])
+        ring_uids = tuple(int(value) for value in guide.source_vertex_uids[:-1])
+        ring_count = len(ring_points)
+        ordered_indices = [
+            (segment_index + 1 + offset) % ring_count
+            for offset in range(ring_count)
+        ]
+        guide.points_local = [ring_points[index] for index in ordered_indices]
+        guide.start_node = int(guide.start_node)
+        guide.end_node = next_node_id(guides)
+        guide.anchors = (
+            tuple(ring_anchors[index] for index in ordered_indices)
+            if anchors_valid
+            else ()
+        )
+        guide.source_vertex_uids = (
+            tuple(ring_uids[index] for index in ordered_indices)
+            if source_valid
+            else ()
+        )
+        return GuideDeleteResult(
+            target_kind="SEGMENT",
+            changed_guide_ids=(retained_id,),
+            message="Guide segment removed; the closed guide is now open.",
+        )
+
+    left_points = [point.copy() for point in guide.points_local[: segment_index + 1]]
+    right_points = [point.copy() for point in guide.points_local[segment_index + 1 :]]
+    left_valid = len(left_points) >= 2
+    right_valid = len(right_points) >= 2
+    fragments = []
+    next_node = next_node_id(guides)
+    if left_valid:
+        left_end = int(guide.end_node) if not right_valid else next_node
+        if not right_valid:
+            # Removing the final segment creates a new endpoint at the last
+            # retained control; the old end-node belonged to the removed end.
+            left_end = next_node
+        next_node += 1
+        fragments.append(
+            GuidePath(
+                guide_id=retained_id,
+                points_local=left_points,
+                start_node=int(guide.start_node),
+                end_node=left_end,
+                logical_side_id=int(guide.logical_side_id),
+                source_kind=str(guide.source_kind),
+                source_vertex_uids=(
+                    tuple(guide.source_vertex_uids[: segment_index + 1])
+                    if source_valid
+                    else ()
+                ),
+                anchors=(
+                    tuple(anchor.copy() for anchor in guide.anchors[: segment_index + 1])
+                    if anchors_valid
+                    else ()
+                ),
+            )
+        )
+    if right_valid:
+        right_id = retained_id if not fragments else next_guide_id(guides)
+        right_start = int(guide.start_node) if left_valid else next_node
+        if left_valid:
+            # Interior segment deletion creates two distinct endpoints across
+            # the gap, not one shared node that would reconnect the fragments.
+            right_start = next_node
+        fragments.append(
+            GuidePath(
+                guide_id=right_id,
+                points_local=right_points,
+                start_node=right_start,
+                end_node=int(guide.end_node),
+                logical_side_id=int(guide.logical_side_id),
+                source_kind=str(guide.source_kind),
+                source_vertex_uids=(
+                    tuple(guide.source_vertex_uids[segment_index + 1 :])
+                    if source_valid
+                    else ()
+                ),
+                anchors=(
+                    tuple(anchor.copy() for anchor in guide.anchors[segment_index + 1 :])
+                    if anchors_valid
+                    else ()
+                ),
+            )
+        )
+    if not fragments:
+        return delete_guide_edge(guides, guide_id)
+    guides[guide_index : guide_index + 1] = fragments
+    changed_ids = tuple(int(fragment.guide_id) for fragment in fragments)
+    return GuideDeleteResult(
+        target_kind="SEGMENT",
+        changed_guide_ids=changed_ids,
+        message="Guide segment removed; dependent regions will be re-evaluated.",
+    )
+
+
+def split_closed_guide_into_sides(guides, guide_id, corner_indices):
+    guide_index = _guide_index_for_id(guides, guide_id)
+    if guide_index is None:
+        return ()
+    guide = guides[guide_index]
+    if int(guide.start_node) != int(guide.end_node):
+        return ()
+    ring_count = len(guide.points_local) - 1
+    corners = tuple(sorted({int(value) % ring_count for value in corner_indices}))
+    if ring_count < 4 or len(corners) != 4:
+        return ()
+
+    anchors_valid = len(guide.anchors) == ring_count + 1
+    source_valid = len(guide.source_vertex_uids) == ring_count + 1
+    ring_points = [point.copy() for point in guide.points_local[:-1]]
+    ring_anchors = tuple(anchor.copy() for anchor in guide.anchors[:-1])
+    ring_uids = tuple(int(value) for value in guide.source_vertex_uids[:-1])
+    node_ids = [int(guide.start_node)]
+    next_node = next_node_id(guides)
+    node_ids.extend(range(next_node, next_node + 3))
+    guide_ids = [int(guide.guide_id)]
+    next_guide = next_guide_id(guides)
+    guide_ids.extend(range(next_guide, next_guide + 3))
+    side_ids = [int(guide.logical_side_id)]
+    next_side = next_logical_side_id(guides)
+    side_ids.extend(range(next_side, next_side + 3))
+
+    sides = []
+    for side_index, start in enumerate(corners):
+        end = corners[(side_index + 1) % 4]
+        indices = [start]
+        current = start
+        while current != end:
+            current = (current + 1) % ring_count
+            indices.append(current)
+        if len(indices) < 2:
+            return ()
+        sides.append(
+            GuidePath(
+                guide_id=guide_ids[side_index],
+                points_local=[ring_points[index] for index in indices],
+                start_node=node_ids[side_index],
+                end_node=node_ids[(side_index + 1) % 4],
+                logical_side_id=side_ids[side_index],
+                source_kind=str(guide.source_kind),
+                source_vertex_uids=(
+                    tuple(ring_uids[index] for index in indices)
+                    if source_valid
+                    else ()
+                ),
+                anchors=(
+                    tuple(ring_anchors[index] for index in indices)
+                    if anchors_valid
+                    else ()
+                ),
+            )
+        )
+    guides[guide_index : guide_index + 1] = sides
+    return tuple(guide_ids)
 
 
 def split_guide(

@@ -83,13 +83,17 @@ from .guide_graph import clone_guides
 from .guide_graph import connected_guide_indices
 from .guide_graph import delete_guide_edge
 from .guide_graph import delete_guide_point
+from .guide_graph import delete_guide_segment
 from .guide_graph import graph_nodes
 from .guide_graph import GuideDeleteError
+from .guide_graph import GuideDeleteResult
 from .guide_graph import GuideGraphBudgetError
 from .guide_graph import GuidePath
+from .guide_graph import insert_guide_control
 from .guide_graph import next_guide_id
 from .guide_graph import next_logical_side_id
 from .guide_graph import next_node_id
+from .guide_graph import split_closed_guide_into_sides
 from .hover_transform import resolve_hover_transform
 from .mesh_sync import frozen_record
 from .mesh_sync import grid_topology
@@ -99,6 +103,7 @@ from .mesh_sync import SYNC_PARAMETRIC
 from .pen_state import PenPhase
 from .pen_state import PenState
 from .projection import SurfaceProjector
+from .region_solver import infer_closed_quad_corner_indices
 from .project_store import audit_projects
 from .project_store import audit_composite_session
 from .project_store import audit_snapshot
@@ -3510,6 +3515,7 @@ class FLOWPATCH_OT_guide_session(Operator):
     _selected_control = None
     _selected_guides = None
     _selected_points = None
+    _selected_segment = None
     _active_anchor = None
     _dragging_control = False
     _g_move = False
@@ -4317,6 +4323,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             "selected_control": self._selected_control,
             "selected_guides": tuple(sorted(self._selected_guides or ())),
             "selected_points": tuple(sorted(self._selected_points or ())),
+            "selected_segment": self._selected_segment,
             "active_anchor": self._active_anchor,
         }
         if include_mesh:
@@ -4369,6 +4376,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._selected_control = snapshot.get("selected_control")
         self._selected_guides = set(snapshot.get("selected_guides", ()))
         self._selected_points = set(snapshot.get("selected_points", ()))
+        self._selected_segment = snapshot.get("selected_segment")
         self._active_anchor = snapshot.get("active_anchor")
         self._sync_scene_settings()
         if rebuild:
@@ -4702,12 +4710,59 @@ class FLOWPATCH_OT_guide_session(Operator):
 
         self._selected_guides = set()
         if self._selected_points:
-            self._selected_control = ref
-            self._active_anchor = ref
+            expanded_ref = self._expand_shared_endpoint_refs(ref)
+            active = (
+                ref
+                if expanded_ref.intersection(self._selected_points)
+                else min(self._selected_points)
+            )
+            self._selected_control = active
+            self._active_anchor = active
         else:
             self._selected_control = None
             self._active_anchor = None
+        self._selected_segment = self._segment_from_selected_points()
         return True
+
+    def _physical_control_key(self, ref):
+        guide_index, point_index = int(ref[0]), int(ref[1])
+        if not (0 <= guide_index < len(self._guides)):
+            return None
+        guide = self._guides[guide_index]
+        if not (0 <= point_index < len(guide.points_local)):
+            return None
+        node_id = 0
+        if point_index == 0:
+            node_id = int(guide.start_node)
+        elif point_index == len(guide.points_local) - 1:
+            node_id = int(guide.end_node)
+        return (
+            ("NODE", node_id)
+            if node_id > 0
+            else ("CONTROL", guide_index, point_index)
+        )
+
+    def _segment_from_selected_points(self):
+        selected_keys = {
+            key
+            for key in (
+                self._physical_control_key(ref)
+                for ref in tuple(self._selected_points or ())
+            )
+            if key is not None
+        }
+        if len(selected_keys) != 2:
+            return None
+        candidates = []
+        for guide_index, guide in enumerate(self._guides):
+            for segment_index in range(len(guide.points_local) - 1):
+                endpoint_keys = {
+                    self._physical_control_key((guide_index, segment_index)),
+                    self._physical_control_key((guide_index, segment_index + 1)),
+                }
+                if endpoint_keys == selected_keys:
+                    candidates.append((guide_index, segment_index))
+        return candidates[0] if len(candidates) == 1 else None
 
     def _select_guide_edge_index(self, guide_index, *, shift=False):
         guide_index = int(guide_index)
@@ -4723,6 +4778,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             selected = {guide_index}
         self._selected_guides = selected
         self._selected_points = set()
+        self._selected_segment = None
         self._selected_control = None
         self._active_anchor = None
         return True
@@ -4731,6 +4787,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._selected_control = None
         self._selected_guides = set()
         self._selected_points = set()
+        self._selected_segment = None
         self._active_anchor = None
 
     def _selected_point_refs(self):
@@ -4767,10 +4824,25 @@ class FLOWPATCH_OT_guide_session(Operator):
 
     def _selected_guide_paths_world(self):
         matrix = self._retopo.matrix_world
-        return [
+        paths = [
             [matrix @ point for point in self._guides[index].points_local]
-            for index in self._selection_guide_indices()
+            for index in sorted(self._selected_guides or ())
+            if 0 <= index < len(self._guides)
         ]
+        if self._selected_segment is not None:
+            guide_index, segment_index = self._selected_segment
+            if (
+                0 <= guide_index < len(self._guides)
+                and 0 <= segment_index < len(self._guides[guide_index].points_local) - 1
+            ):
+                guide = self._guides[guide_index]
+                paths.append(
+                    [
+                        matrix @ guide.points_local[segment_index],
+                        matrix @ guide.points_local[segment_index + 1],
+                    ]
+                )
+        return paths
 
     def _sync_scene_settings(self):
         if self._scene is None:
@@ -5261,10 +5333,37 @@ class FLOWPATCH_OT_guide_session(Operator):
         )
         if not plan.cycle_keys:
             return 0
+        if not self._history:
+            self.report(
+                {"WARNING"},
+                "Auto Build deferred; no guide undo checkpoint is available.",
+            )
+            return 0
+        history_snapshot = self._history[-1]
+        if "_mesh_backup" not in history_snapshot:
+            backup = None
+            try:
+                bm = bmesh.from_edit_mesh(self._retopo.data)
+                backup = _begin_auto_build_mesh_snapshot(bm)
+                properties = _capture_flowpatch_id_properties(self._retopo)
+            except Exception as exc:
+                _discard_auto_build_mesh_snapshot(backup)
+                self.report(
+                    {"WARNING"},
+                    f"Auto Build deferred; undo snapshot failed: {exc}",
+                )
+                SESSION_BREADCRUMBS.record(
+                    "auto_build_undo_snapshot_rejected",
+                    message=str(exc),
+                )
+                return 0
+            history_snapshot["_mesh_backup"] = backup
+            history_snapshot["_flowpatch_properties"] = properties
         if not self._commit_ready_cells(
             context,
             cycle_keys=plan.cycle_keys,
             auto_build=True,
+            preserve_history=True,
         ):
             SESSION_BREADCRUMBS.record(
                 "auto_build_retained_for_retry",
@@ -5320,7 +5419,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._apply_frozen_stroke_snaps()
         self._push_history()
         try:
-            append_guide_world(
+            new_guide = append_guide_world(
                 self._retopo,
                 self._guides,
                 self._stroke_world,
@@ -5331,6 +5430,46 @@ class FLOWPATCH_OT_guide_session(Operator):
                     self._stroke_snap_release,
                 ),
             )
+            candidate = next(
+                (
+                    guide
+                    for guide in self._guides
+                    if int(guide.guide_id) == int(new_guide.guide_id)
+                ),
+                None,
+            )
+            if (
+                candidate is not None
+                and int(candidate.start_node) == int(candidate.end_node)
+            ):
+                matrix = self._retopo.matrix_world
+                screen_points = []
+                for point_local in candidate.points_local:
+                    point_2d = view3d_utils.location_3d_to_region_2d(
+                        self._region,
+                        self._region_3d,
+                        matrix @ point_local,
+                    )
+                    if point_2d is None:
+                        screen_points = []
+                        break
+                    screen_points.append(Vector(point_2d))
+                corners = infer_closed_quad_corner_indices(screen_points)
+                split_ids = (
+                    split_closed_guide_into_sides(
+                        self._guides,
+                        candidate.guide_id,
+                        corners,
+                    )
+                    if corners
+                    else ()
+                )
+                if split_ids:
+                    SESSION_BREADCRUMBS.record(
+                        "closed_quad_normalized",
+                        source_guide_id=int(candidate.guide_id),
+                        side_guide_ids=split_ids,
+                    )
             self._refresh_surface_anchors()
         except (FlowPatchGeometryError, GuideGraphBudgetError) as exc:
             if self._history:
@@ -5419,17 +5558,10 @@ class FLOWPATCH_OT_guide_session(Operator):
             self.report({"INFO"}, "Hover a retained guide, then press L.")
             return False
         self._selected_guides = set(selected)
-        self._selected_points = {
-            (guide_index, point_index)
-            for guide_index in selected
-            for point_index in range(
-                len(self._guides[guide_index].points_local)
-            )
-        }
+        self._selected_points = set()
+        self._selected_segment = None
         self._selected_control = None
-        self._active_anchor = (
-            min(self._selected_points) if self._selected_points else None
-        )
+        self._active_anchor = None
         self._mode = "EDIT"
         self._update_renderer()
         self.report(
@@ -5535,6 +5667,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._selected_points = set(
             snapshot.get("selected_points", ())
         )
+        self._selected_segment = snapshot.get("selected_segment")
         self._active_anchor = snapshot.get("active_anchor")
 
     def _start_transform(self, context, event, mode):
@@ -5543,12 +5676,72 @@ class FLOWPATCH_OT_guide_session(Operator):
         selected_refs = self._selected_point_refs()
         hover_hit = None
         hover_refs = ()
+        inserted_control = False
         if not selected_refs:
-            hover_hit = self._snap_candidate(
-                self._region_mouse(event),
-                _SNAP_HOVER_PX,
-            )
-            hover_refs = self._hover_transform_refs(hover_hit)
+            mouse = self._region_mouse(event)
+            if mode == "MOVE":
+                control_ref = self._nearest_control(mouse)
+                if control_ref is not None:
+                    guide_index, point_index = control_ref
+                    point_world = (
+                        self._retopo.matrix_world
+                        @ self._guides[guide_index].points_local[point_index]
+                    )
+                    hover_hit = {
+                        "kind": "GUIDE_CONTROL",
+                        "guide_index": guide_index,
+                        "point_index": point_index,
+                        "point_world": point_world,
+                    }
+                    hover_refs = tuple(
+                        sorted(self._expand_shared_endpoint_refs(control_ref))
+                    )
+                else:
+                    hover_hit = self._nearest_guide_segment(
+                        mouse,
+                        radius_px=_SNAP_HOVER_PX,
+                    )
+                    if hover_hit is not None:
+                        guide_index = int(hover_hit["guide_index"])
+                        guide = self._guides[guide_index]
+                        if self._guide_is_locked(guide.guide_id):
+                            self.report(
+                                {"WARNING"},
+                                "This committed region is frozen; use the Sync controls.",
+                            )
+                            return False
+                        before_count = len(guide.points_local)
+                        guide_index, point_index = insert_guide_control(
+                            self._guides,
+                            guide.guide_id,
+                            hover_hit["segment_index"],
+                            hover_hit["factor"],
+                            self._retopo.matrix_world.inverted_safe()
+                            @ Vector(hover_hit["point_world"]),
+                        )
+                        inserted_control = (
+                            len(self._guides[guide_index].points_local)
+                            > before_count
+                        )
+                        hover_hit = dict(hover_hit)
+                        hover_hit["kind"] = "GUIDE_CONTROL"
+                        hover_hit["guide_index"] = guide_index
+                        hover_hit["point_index"] = point_index
+                        hover_refs = tuple(
+                            sorted(
+                                self._expand_shared_endpoint_refs(
+                                    (guide_index, point_index)
+                                )
+                            )
+                        )
+            else:
+                hover_hit = self._snap_candidate(mouse, _SNAP_HOVER_PX)
+                hover_refs = self._hover_transform_refs(hover_hit)
+
+        def rollback_inserted_control():
+            if inserted_control:
+                self._restore_state(persistent_snapshot, rebuild=False)
+
         decision = resolve_hover_transform(
             mode,
             selected_refs=selected_refs,
@@ -5560,6 +5753,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             hover_refs=hover_refs,
         )
         if not decision.accepted:
+            rollback_inserted_control()
             self.report({"INFO"}, decision.message)
             return False
         refs = decision.refs
@@ -5569,6 +5763,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             self._guide_is_locked(self._guides[index].guide_id)
             for index in selected_indices
         ):
+            rollback_inserted_control()
             self.report(
                 {"WARNING"},
                 "This committed region is frozen; use the Sync controls.",
@@ -5590,6 +5785,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             center_world,
         )
         if center_screen is None:
+            rollback_inserted_control()
             self.report({"WARNING"}, "The selected guides are outside this view.")
             return False
 
@@ -5616,6 +5812,7 @@ class FLOWPATCH_OT_guide_session(Operator):
                 **_continuity_kwargs(settings),
             )
         if surface_anchor is None:
+            rollback_inserted_control()
             self.report(
                 {"WARNING"},
                 "FlowPatch could not establish a surface tangent for this transform.",
@@ -5623,6 +5820,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             return False
         tangent_normal = Vector(surface_anchor[1])
         if tangent_normal.length <= 1.0e-8:
+            rollback_inserted_control()
             self.report(
                 {"WARNING"},
                 "FlowPatch received an invalid surface normal for this transform.",
@@ -5633,10 +5831,11 @@ class FLOWPATCH_OT_guide_session(Operator):
         if decision.temporary:
             self._selected_points = set(refs)
             self._selected_guides = set()
+            self._selected_segment = None
             self._selected_control = (
                 refs[0]
                 if str(hover_hit.get("kind", "")).upper()
-                == "CANONICAL_NODE"
+                in {"CANONICAL_NODE", "GUIDE_CONTROL"}
                 else None
             )
             self._active_anchor = refs[0]
@@ -6047,23 +6246,39 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._rebuild_previews()
 
     def _selected_delete_target(self):
+        if self._selected_segment is not None:
+            guide_index, segment_index = self._selected_segment
+            if (
+                not (0 <= guide_index < len(self._guides))
+                or not (
+                    0
+                    <= segment_index
+                    < len(self._guides[guide_index].points_local) - 1
+                )
+            ):
+                raise GuideDeleteError(
+                    "SEGMENT_NOT_FOUND",
+                    "The selected guide segment no longer exists.",
+                )
+            return "SEGMENT", int(guide_index), int(segment_index)
+
         if (
             self._selected_guides
             and not self._selected_points
             and self._selected_control is None
         ):
-            if len(self._selected_guides) != 1:
-                raise GuideDeleteError(
-                    "MULTIPLE_EDGE_SELECTION",
-                    "Select exactly one GuideEdge before deleting.",
-                )
-            guide_index = next(iter(self._selected_guides))
-            if not (0 <= guide_index < len(self._guides)):
+            guide_indices = tuple(sorted(int(value) for value in self._selected_guides))
+            if any(
+                not (0 <= guide_index < len(self._guides))
+                for guide_index in guide_indices
+            ):
                 raise GuideDeleteError(
                     "GUIDE_NOT_FOUND",
-                    "The selected GuideEdge no longer exists.",
+                    "A selected GuideEdge no longer exists.",
                 )
-            return "EDGE", int(guide_index), -1
+            if len(guide_indices) == 1:
+                return "EDGE", guide_indices[0], -1
+            return "SHAPE", guide_indices, -1
 
         if self._selected_control is None:
             raise GuideDeleteError(
@@ -6083,6 +6298,22 @@ class FLOWPATCH_OT_guide_session(Operator):
             )
         return "POINT", active[0], active[1]
 
+    def _hover_delete_target(self, event):
+        if event is None or not self._mouse_in_region(event):
+            return None
+        mouse = self._region_mouse(event)
+        control = self._nearest_control(mouse)
+        if control is not None:
+            return "POINT", int(control[0]), int(control[1])
+        segment = self._nearest_guide_segment(mouse, radius_px=11.0)
+        if segment is None:
+            return None
+        return (
+            "SEGMENT",
+            int(segment["guide_index"]),
+            int(segment["segment_index"]),
+        )
+
     def _built_cell_keys_for_guides(self, guide_ids):
         guide_ids = {int(value) for value in guide_ids}
         return tuple(
@@ -6097,7 +6328,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             )
         )
 
-    def _delete_guide(self, context):
+    def _delete_guide(self, context, event=None):
         if not self._guides:
             self.report({"WARNING"}, "There are no guides to delete.")
             return False
@@ -6106,12 +6337,36 @@ class FLOWPATCH_OT_guide_session(Operator):
                 self._selected_delete_target()
             )
         except GuideDeleteError as exc:
-            self.report({"WARNING"}, str(exc))
-            return False
+            has_selection = bool(
+                self._selected_guides
+                or self._selected_points
+                or self._selected_control is not None
+                or self._selected_segment is not None
+            )
+            hover_target = None if has_selection else self._hover_delete_target(event)
+            if hover_target is None:
+                self.report({"WARNING"}, str(exc))
+                return False
+            target_kind, guide_index, point_index = hover_target
 
         staged_guides = clone_guides(self._guides)
         try:
-            if target_kind == "EDGE":
+            if target_kind == "SHAPE":
+                guide_ids = tuple(
+                    int(self._guides[index].guide_id)
+                    for index in guide_index
+                )
+                for guide_id in guide_ids:
+                    delete_guide_edge(staged_guides, guide_id)
+                result = GuideDeleteResult(
+                    target_kind="SHAPE",
+                    removed_guide_ids=tuple(sorted(guide_ids)),
+                    message=(
+                        f"Deleted {len(guide_ids)} selected guide edges; "
+                        "dependent regions were re-evaluated."
+                    ),
+                )
+            elif target_kind == "EDGE":
                 guide_id = int(self._guides[guide_index].guide_id)
                 owner_keys = self._built_cell_keys_for_guides((guide_id,))
                 if len(owner_keys) > 1:
@@ -6120,6 +6375,13 @@ class FLOWPATCH_OT_guide_session(Operator):
                         "This GuideEdge is shared by built regions; use Dissolve/Reflow.",
                     )
                 result = delete_guide_edge(staged_guides, guide_id)
+            elif target_kind == "SEGMENT":
+                guide_id = int(self._guides[guide_index].guide_id)
+                result = delete_guide_segment(
+                    staged_guides,
+                    guide_id,
+                    point_index,
+                )
             else:
                 result = delete_guide_point(
                     staged_guides,
@@ -6912,6 +7174,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             self._selected_control = None
             self._selected_guides = set()
             self._selected_points = set()
+            self._selected_segment = None
             self._active_anchor = None
             self._dragging_control = False
             self._g_move = False
@@ -7147,7 +7410,7 @@ class FLOWPATCH_OT_guide_session(Operator):
 
         if event.type in {"BACK_SPACE", "DEL", "X"} and event.value == "PRESS":
             self._exit_armed = False
-            self._delete_guide(context)
+            self._delete_guide(context, event)
             return {"RUNNING_MODAL"}
 
         if event.type in {"RET", "NUMPAD_ENTER"} and event.value == "PRESS":
