@@ -121,8 +121,8 @@ class DiagnosticsPureTests(unittest.TestCase):
         self.assertEqual(decoded["warnings"], ["project object missing"])
 
     def test_build_identity_is_complete_and_versioned(self):
-        self.assertEqual(build_identity.ADDON_VERSION, (1, 4, 14))
-        self.assertTrue(build_identity.BUILD_ID.startswith("recovery-p0-"))
+        self.assertEqual(build_identity.ADDON_VERSION, (1, 4, 15))
+        self.assertTrue(build_identity.BUILD_ID.startswith("recovery-p1-"))
         self.assertRegex(
             build_identity.PACKAGE_PAYLOAD_SHA256,
             re.compile(r"^[0-9A-F]{64}$"),
@@ -131,8 +131,8 @@ class DiagnosticsPureTests(unittest.TestCase):
         manifest = (ROOT / "blender_manifest.toml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('"version": (1, 4, 14)', init_source)
-        self.assertIn('version = "1.4.14"', manifest)
+        self.assertIn('"version": (1, 4, 15)', init_source)
+        self.assertIn('version = "1.4.15"', manifest)
 
     def test_payload_hash_matches_canonical_runtime_files(self):
         runtime_files = sorted(

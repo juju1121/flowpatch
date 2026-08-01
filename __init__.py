@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FlowPatch Retopo",
     "author": "Independent clean-room implementation",
-    "version": (1, 4, 14),
+    "version": (1, 4, 15),
     "blender": (4, 3, 0),
     "location": "3D Viewport > FlowPatch panel or F7",
     "description": "Build editable quad patches from retained surface guides",

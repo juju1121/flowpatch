@@ -2,6 +2,7 @@ import json
 import math
 from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import field
 
 import bmesh
 from mathutils import Vector
@@ -27,6 +28,7 @@ from .guide_graph import graph_nodes
 from .guide_graph import next_guide_id
 from .guide_graph import next_logical_side_id
 from .guide_graph import next_node_id
+from .guide_graph import oriented_side_anchors
 from .guide_graph import oriented_side_points
 from .guide_graph import replace_node_id
 from .guide_graph import split_guide
@@ -57,6 +59,7 @@ VERTEX_UID_COUNTER_KEY = "flowpatch_vertex_uid_counter_v1"
 VERTEX_UID_LAYER = "flowpatch_vertex_uid"
 MAX_PREVIEW_CELLS = 128
 MAX_PREVIEW_FACES = 100_000
+MAX_PREVIEW_EDGE_RATIO = 100.0
 from .v140_backend import (
     is_convex_ring,
     matched_annular_quad_patch,
@@ -96,6 +99,13 @@ class GuidePatchPreview:
     boundary_loop_node_ids: tuple = ()
     source_cycle_keys: tuple = ()
     side_edge_ids: tuple = ()
+    target_object_uuid: str = ""
+    frontface_epsilon: float = 0.001
+    max_projection_distance: float = 0.0
+    max_surface_step: float = 0.0
+    normal_continuity_cos: float = -0.05
+    flat_target_tolerance: float = 0.0005
+    validation_metrics: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.topology_kind != "POLYGON" or not self.polygon_world:
@@ -207,6 +217,7 @@ def _anchor_from_payload(payload):
         local_normal=Vector(payload.get("local_normal", (0.0, 0.0, 1.0))),
         normal_offset=float(payload.get("normal_offset", 0.0)),
         topology_revision=int(payload.get("topology_revision", 0)),
+        shell_component=int(payload.get("shell_component", -1)),
     )
 
 
@@ -222,6 +233,7 @@ def _anchor_payload(anchor):
         "local_normal": _vector_payload(anchor.local_normal),
         "normal_offset": round(float(anchor.normal_offset), 8),
         "topology_revision": int(anchor.topology_revision),
+        "shell_component": int(anchor.shell_component),
     }
 
 
@@ -231,34 +243,159 @@ def refresh_guide_surface_anchors(
     projector,
     target_object_uuid,
     normal_offset=0.0,
+    max_projection_distance=0.0,
+    max_surface_step=0.0,
+    normal_continuity_cos=-0.05,
 ):
     staged = []
+    inverse = obj.matrix_world.inverted_safe()
     for guide in guides:
         anchors = []
-        for point_local in guide.points_local:
+        points_local = []
+        existing_anchors = (
+            tuple(guide.anchors)
+            if len(guide.anchors) == len(guide.points_local)
+            else ()
+        )
+        previous_anchor = None
+        for point_index, point_local in enumerate(guide.points_local):
             point_world = obj.matrix_world @ Vector(point_local)
-            nearest = projector.nearest_target_local(point_world)
+            existing_anchor = (
+                existing_anchors[point_index]
+                if existing_anchors
+                and str(existing_anchors[point_index].target_object_uuid)
+                == str(target_object_uuid)
+                else None
+            )
+            continuity_anchor = existing_anchor or previous_anchor
+            nearest = projector.nearest_world_continuous(
+                point_world,
+                target_object_uuid=str(target_object_uuid),
+                previous_anchor=continuity_anchor,
+                surface_offset=float(normal_offset),
+                max_projection_distance=float(max_projection_distance),
+                max_surface_step=float(max_surface_step),
+                normal_continuity_cos=float(normal_continuity_cos),
+            )
+            if (
+                nearest is None
+                and existing_anchor is None
+                and previous_anchor is not None
+            ):
+                nearest = projector.nearest_world_continuous(
+                    point_world,
+                    target_object_uuid=str(target_object_uuid),
+                    previous_anchor=None,
+                    surface_offset=float(normal_offset),
+                    max_projection_distance=float(max_projection_distance),
+                    max_surface_step=float(max_surface_step),
+                    normal_continuity_cos=float(normal_continuity_cos),
+                )
+            if nearest is None and existing_anchor is not None:
+                last_valid = projector.world_from_anchor(existing_anchor)
+                if last_valid is not None:
+                    nearest = (
+                        last_valid[0],
+                        last_valid[1],
+                        int(existing_anchor.face_index),
+                        0.0,
+                        existing_anchor.copy(),
+                    )
             if nearest is None:
                 raise FlowPatchGeometryError(
-                    "A guide control has no valid target-surface anchor."
+                    "REJECTED_PROJECTION: a guide control has no safe "
+                    "same-side target anchor."
                 )
-            location, normal, face_index, _distance = nearest
-            anchors.append(
-                SurfaceAnchor(
-                    target_object_uuid=str(target_object_uuid),
-                    face_index=int(face_index),
-                    triangle_index=-1,
-                    barycentric=(),
-                    local_position=Vector(location),
-                    local_normal=Vector(normal).normalized(),
-                    normal_offset=float(normal_offset),
-                    topology_revision=int(projector.topology_revision),
-                )
-            )
-        staged.append(tuple(anchors))
-    for guide, anchors in zip(guides, staged):
+            projected_world, _normal, _face_index, _distance, anchor = nearest
+            anchors.append(anchor)
+            points_local.append(inverse @ Vector(projected_world))
+            previous_anchor = anchor
+        staged.append((points_local, tuple(anchors)))
+    for guide, (points_local, anchors) in zip(guides, staged):
+        guide.points_local = points_local
         guide.anchors = anchors
-    return sum(len(anchors) for anchors in staged)
+    return sum(len(anchors) for _points, anchors in staged)
+
+
+def fair_guides_tangent(
+    obj,
+    guides,
+    guide_indices,
+    projector,
+    target_object_uuid,
+    strength=0.35,
+    iterations=2,
+    surface_offset=0.0,
+    max_projection_distance=0.0,
+    max_surface_step=0.0,
+    normal_continuity_cos=-0.05,
+):
+    staged_guides = clone_guides(guides)
+    selected = tuple(sorted({int(index) for index in guide_indices}))
+    strength = max(0.0, min(1.0, float(strength)))
+    iterations = max(1, min(32, int(iterations)))
+    matrix = obj.matrix_world
+    inverse = matrix.inverted_safe()
+    moved_count = 0
+
+    for _iteration in range(iterations):
+        staged_iteration = []
+        for guide_index in selected:
+            guide = staged_guides[guide_index]
+            if len(guide.points_local) < 3:
+                continue
+            if len(guide.anchors) != len(guide.points_local):
+                raise FlowPatchGeometryError(
+                    "REJECTED_PROJECTION: Relax needs valid per-point "
+                    "surface anchors."
+                )
+            source = [point.copy() for point in guide.points_local]
+            source_anchors = [anchor.copy() for anchor in guide.anchors]
+            points = [point.copy() for point in source]
+            anchors = [anchor.copy() for anchor in source_anchors]
+            for point_index in range(1, len(source) - 1):
+                anchor = source_anchors[point_index]
+                frame = projector.world_from_anchor(anchor)
+                if frame is None:
+                    raise FlowPatchGeometryError(
+                        "REJECTED_PROJECTION: Relax lost a surface anchor."
+                    )
+                current_world = matrix @ source[point_index]
+                average_world = matrix @ (
+                    (source[point_index - 1] + source[point_index + 1])
+                    * 0.5
+                )
+                normal_world = Vector(frame[1]).normalized()
+                displacement = average_world - current_world
+                tangent = displacement - normal_world * displacement.dot(
+                    normal_world
+                )
+                candidate_world = current_world + tangent * strength
+                nearest = projector.nearest_world_continuous(
+                    candidate_world,
+                    target_object_uuid=str(target_object_uuid),
+                    previous_anchor=anchor,
+                    surface_offset=float(surface_offset),
+                    max_projection_distance=float(max_projection_distance),
+                    max_surface_step=float(max_surface_step),
+                    normal_continuity_cos=float(normal_continuity_cos),
+                )
+                if nearest is None:
+                    raise FlowPatchGeometryError(
+                        "REJECTED_PROJECTION: Relax could not keep a "
+                        "control on the same target side."
+                    )
+                points[point_index] = inverse @ Vector(nearest[0])
+                anchors[point_index] = nearest[4].copy()
+                moved_count += 1
+            staged_iteration.append((guide_index, points, tuple(anchors)))
+        for guide_index, points, anchors in staged_iteration:
+            staged_guides[guide_index].points_local = points
+            staged_guides[guide_index].anchors = anchors
+
+    for guide_index in selected:
+        guides[guide_index] = staged_guides[guide_index]
+    return moved_count
 
 
 def load_guides(obj):
@@ -752,12 +889,52 @@ def _resample_polyline(points, count):
     return output
 
 
+def _resample_polyline_with_anchors(points, anchors, count):
+    if len(anchors) != len(points):
+        return _resample_polyline(points, count), []
+    if count < 2:
+        raise FlowPatchGeometryError("A guide side needs at least two samples.")
+    if len(points) < 2:
+        raise FlowPatchGeometryError("A guide side is too short.")
+
+    lengths = [0.0]
+    for start, end in zip(points, points[1:]):
+        lengths.append(lengths[-1] + (end - start).length)
+    total = lengths[-1]
+    if total <= 1.0e-9:
+        raise FlowPatchGeometryError("A guide side has zero length.")
+
+    output_points = []
+    output_anchors = []
+    segment = 0
+    for index in range(count):
+        target = total * index / (count - 1)
+        while segment < len(lengths) - 2 and lengths[segment + 1] < target:
+            segment += 1
+        span = lengths[segment + 1] - lengths[segment]
+        factor = 0.0 if span <= 1.0e-9 else (target - lengths[segment]) / span
+        output_points.append(
+            points[segment].lerp(points[segment + 1], factor)
+        )
+        output_anchors.append(
+            anchors[segment].interpolated(anchors[segment + 1], factor)
+        )
+    return output_points, output_anchors
+
+
 def _side_world_points(obj, side, guide_by_id):
     try:
         local_points = oriented_side_points(side, guide_by_id)
     except ValueError as exc:
         raise FlowPatchGeometryError(str(exc)) from exc
     return [obj.matrix_world @ point for point in local_points]
+
+
+def _side_surface_anchors(side, guide_by_id):
+    try:
+        return oriented_side_anchors(side, guide_by_id)
+    except ValueError as exc:
+        raise FlowPatchGeometryError(str(exc)) from exc
 
 
 def _cycle_boundary_world_points(obj, cycle, guide_by_id):
@@ -1360,13 +1537,42 @@ def validate_boundary_sides(side_points, tolerance=1.0e-5):
     return normal
 
 
-def validate_preview_grid(rails, reference_normal):
+def validate_preview_grid(
+    rails,
+    reference_normal,
+    flat_target_tolerance=0.0005,
+):
     if len(rails) < 2 or len(rails[0]) < 2:
         raise FlowPatchGeometryError("The patch grid needs at least one quad.")
     width = len(rails[0])
     if any(len(rail) != width for rail in rails):
         raise FlowPatchGeometryError("The patch grid is not rectangular.")
 
+    normal = Vector(reference_normal)
+    if normal.length <= 1.0e-12:
+        raise FlowPatchGeometryError(
+            "The patch grid has no stable reference normal."
+        )
+    normal.normalize()
+    origin = Vector(rails[0][0])
+    boundary = list(rails[0]) + list(rails[-1])
+    boundary.extend(rail[0] for rail in rails[1:-1])
+    boundary.extend(rail[-1] for rail in rails[1:-1])
+    boundary_deviation = max(
+        (abs((Vector(point) - origin).dot(normal)) for point in boundary),
+        default=0.0,
+    )
+    patch_deviation = max(
+        (
+            abs((Vector(point) - origin).dot(normal))
+            for rail in rails
+            for point in rail
+        ),
+        default=0.0,
+    )
+    minimum_signed_area = math.inf
+    maximum_edge_ratio = 1.0
+    normal_flip_count = 0
     for row_index in range(len(rails) - 1):
         for column_index in range(width - 1):
             p00 = rails[row_index][column_index]
@@ -1379,17 +1585,62 @@ def validate_preview_grid(rails, reference_normal):
                 raise FlowPatchGeometryError(
                     "The patch preview contains a collapsed quad."
                 )
-            if first.dot(reference_normal) <= 1.0e-10:
+            first_signed_area = 0.5 * first.dot(normal)
+            second_signed_area = 0.5 * second.dot(normal)
+            signed_area = first_signed_area + second_signed_area
+            minimum_signed_area = min(minimum_signed_area, signed_area)
+            if first_signed_area <= 1.0e-10 or second_signed_area <= 1.0e-10:
+                normal_flip_count += 1
+            edge_lengths = (
+                (p10 - p00).length,
+                (p11 - p10).length,
+                (p01 - p11).length,
+                (p00 - p01).length,
+            )
+            minimum_edge = min(edge_lengths)
+            if minimum_edge <= 1.0e-10:
                 raise FlowPatchGeometryError(
-                    "The patch preview folds or reverses its winding."
+                    "The patch preview contains a collapsed edge."
                 )
-            if second.dot(reference_normal) <= 1.0e-10:
-                raise FlowPatchGeometryError(
-                    "The patch preview folds or reverses its winding."
-                )
+            maximum_edge_ratio = max(
+                maximum_edge_ratio,
+                max(edge_lengths) / minimum_edge,
+            )
+
+    metrics = {
+        "patch_max_plane_deviation": float(patch_deviation),
+        "min_quad_signed_area": float(minimum_signed_area),
+        "max_edge_ratio": float(maximum_edge_ratio),
+        "normal_flip_count": int(normal_flip_count),
+        "boundary_max_plane_deviation": float(boundary_deviation),
+    }
+    if normal_flip_count:
+        raise FlowPatchGeometryError(
+            "The patch preview folds or reverses its winding."
+        )
+    if maximum_edge_ratio > MAX_PREVIEW_EDGE_RATIO:
+        raise FlowPatchGeometryError(
+            "The patch preview exceeds the safe quad edge-ratio limit."
+        )
+    tolerance = max(0.0, float(flat_target_tolerance))
+    if boundary_deviation <= tolerance and patch_deviation > tolerance:
+        raise FlowPatchGeometryError(
+            "REJECTED_PROJECTION: a planar target produced an off-plane "
+            "patch preview."
+        )
+    return metrics
 
 
-def _project_grid_interior(base_rails, projector, surface_offset):
+def _project_grid_interior(
+    base_rails,
+    projector,
+    surface_offset,
+    boundary_anchors=(),
+    target_object_uuid="",
+    max_projection_distance=0.0,
+    max_surface_step=0.0,
+    normal_continuity_cos=-0.05,
+):
     projected = [
         [point.copy() for point in rail]
         for rail in base_rails
@@ -1398,17 +1649,34 @@ def _project_grid_interior(base_rails, projector, surface_offset):
         return projected
     last_row = len(projected) - 1
     last_column = len(projected[0]) - 1
+    left_anchors = (
+        tuple(boundary_anchors[3])
+        if len(boundary_anchors) == 4
+        else ()
+    )
     for row_index in range(1, last_row):
+        previous_anchor = (
+            left_anchors[row_index]
+            if len(left_anchors) == len(projected)
+            else None
+        )
         for column_index in range(1, last_column):
-            nearest = projector.nearest_world(
+            nearest = projector.nearest_world_continuous(
                 base_rails[row_index][column_index],
-                surface_offset,
+                target_object_uuid=str(target_object_uuid),
+                previous_anchor=previous_anchor,
+                surface_offset=float(surface_offset),
+                max_projection_distance=float(max_projection_distance),
+                max_surface_step=float(max_surface_step),
+                normal_continuity_cos=float(normal_continuity_cos),
             )
             if nearest is None:
                 raise FlowPatchGeometryError(
-                    "The target projection failed inside this cell."
+                    "REJECTED_PROJECTION: the target projection failed "
+                    "inside this cell."
                 )
             projected[row_index][column_index] = Vector(nearest[0])
+            previous_anchor = nearest[4]
     return projected
 
 
@@ -1496,6 +1764,12 @@ def build_cycle_preview(
     surface_smoothing_radius=1,
     detail_ignore_threshold=0.0,
     boundary_registry=None,
+    target_object_uuid="",
+    frontface_epsilon=0.001,
+    max_projection_distance=0.0,
+    max_surface_step=0.0,
+    normal_continuity_cos=-0.05,
+    flat_target_tolerance=0.0005,
 ):
     boundary_registry = boundary_registry or {}
     sides = _oriented_cycle_sides(
@@ -1525,26 +1799,48 @@ def build_cycle_preview(
         _side_world_points(obj, side, guide_by_id)
         for side in sides
     ]
+    side_anchors = [
+        _side_surface_anchors(side, guide_by_id)
+        for side in sides
+    ]
     reference_normal = validate_boundary_sides(side_points)
     bottom_world, right_world, top_forward_world, left_forward_world = side_points
+    (
+        bottom_world_anchors,
+        right_world_anchors,
+        top_forward_world_anchors,
+        left_forward_world_anchors,
+    ) = side_anchors
     top_world = list(reversed(top_forward_world))
     left_world = list(reversed(left_forward_world))
+    top_world_anchors = list(reversed(top_forward_world_anchors))
+    left_world_anchors = list(reversed(left_forward_world_anchors))
 
-    bottom = _resample_polyline(
+    bottom, bottom_anchors = _resample_polyline_with_anchors(
         bottom_world,
+        bottom_world_anchors,
         u_segments + 1,
     )
-    top = _resample_polyline(
+    top, top_anchors = _resample_polyline_with_anchors(
         top_world,
+        top_world_anchors,
         u_segments + 1,
     )
-    left = _resample_polyline(
+    left, left_anchors = _resample_polyline_with_anchors(
         left_world,
+        left_world_anchors,
         v_segments + 1,
     )
-    right = _resample_polyline(
+    right, right_anchors = _resample_polyline_with_anchors(
         right_world,
+        right_world_anchors,
         v_segments + 1,
+    )
+    boundary_anchors = (
+        bottom_anchors,
+        right_anchors,
+        top_anchors,
+        left_anchors,
     )
 
     p00 = bottom[0]
@@ -1583,27 +1879,62 @@ def build_cycle_preview(
         base_rails.append(rail)
 
     resolved_mode = str(projection_mode).upper()
-    if resolved_mode == "FLATTENED":
-        rails = base_rails
-    else:
-        raw_rails = _project_grid_interior(
+    raw_rails = _project_grid_interior(
+        base_rails,
+        projector,
+        surface_offset,
+        boundary_anchors=boundary_anchors,
+        target_object_uuid=target_object_uuid,
+        max_projection_distance=max_projection_distance,
+        max_surface_step=max_surface_step,
+        normal_continuity_cos=normal_continuity_cos,
+    )
+    if resolved_mode in {"SURFACE", "RAW"}:
+        rails = raw_rails
+    elif resolved_mode == "FLATTENED":
+        flattened_rails = _surface_fit_grid(
             base_rails,
+            raw_rails,
+            0.0,
+            surface_tighten_strength,
+            surface_smoothing_radius,
+            detail_ignore_threshold,
+        )
+        rails = _project_grid_interior(
+            flattened_rails,
             projector,
             surface_offset,
+            boundary_anchors=boundary_anchors,
+            target_object_uuid=target_object_uuid,
+            max_projection_distance=max_projection_distance,
+            max_surface_step=max_surface_step,
+            normal_continuity_cos=normal_continuity_cos,
         )
-        if resolved_mode in {"SURFACE", "RAW"}:
-            rails = raw_rails
-        else:
-            rails = _surface_fit_grid(
-                base_rails,
-                raw_rails,
-                surface_follow_strength,
-                surface_tighten_strength,
-                surface_smoothing_radius,
-                detail_ignore_threshold,
-            )
+    else:
+        fitted_rails = _surface_fit_grid(
+            base_rails,
+            raw_rails,
+            surface_follow_strength,
+            surface_tighten_strength,
+            surface_smoothing_radius,
+            detail_ignore_threshold,
+        )
+        rails = _project_grid_interior(
+            fitted_rails,
+            projector,
+            surface_offset,
+            boundary_anchors=boundary_anchors,
+            target_object_uuid=target_object_uuid,
+            max_projection_distance=max_projection_distance,
+            max_surface_step=max_surface_step,
+            normal_continuity_cos=normal_continuity_cos,
+        )
 
-    validate_preview_grid(rails, reference_normal)
+    validation_metrics = validate_preview_grid(
+        rails,
+        reference_normal,
+        flat_target_tolerance=flat_target_tolerance,
+    )
     return GuidePatchPreview(
         cycle_key=cycle.key,
         edge_ids=tuple(
@@ -1636,6 +1967,13 @@ def build_cycle_preview(
         surface_smoothing_radius=int(surface_smoothing_radius),
         surface_offset=float(surface_offset),
         detail_ignore_threshold=float(detail_ignore_threshold),
+        target_object_uuid=str(target_object_uuid),
+        frontface_epsilon=float(frontface_epsilon),
+        max_projection_distance=float(max_projection_distance),
+        max_surface_step=float(max_surface_step),
+        normal_continuity_cos=float(normal_continuity_cos),
+        flat_target_tolerance=float(flat_target_tolerance),
+        validation_metrics=validation_metrics,
     )
 
 
@@ -1947,6 +2285,12 @@ def build_uncommitted_previews(
     detail_ignore_threshold=0.0,
     validation_errors=None,
     density_overrides=None,
+    target_object_uuid="",
+    frontface_epsilon=0.001,
+    max_projection_distance=0.0,
+    max_surface_step=0.0,
+    normal_continuity_cos=-0.05,
+    flat_target_tolerance=0.0005,
 ):
     all_cycles, _edge_nodes, guide_by_id = find_bounded_regions(
         obj,
@@ -2110,6 +2454,12 @@ def build_uncommitted_previews(
                 surface_smoothing_radius=surface_smoothing_radius,
                 detail_ignore_threshold=detail_ignore_threshold,
                 boundary_registry=planned_registry,
+                target_object_uuid=target_object_uuid,
+                frontface_epsilon=frontface_epsilon,
+                max_projection_distance=max_projection_distance,
+                max_surface_step=max_surface_step,
+                normal_continuity_cos=normal_continuity_cos,
+                flat_target_tolerance=flat_target_tolerance,
             )
             for side_index, side_key in enumerate(preview.side_keys):
                 side_axis = _axis_for_side_index(side_index)
@@ -2293,6 +2643,26 @@ def _cell_record(
         "detail_ignore_threshold": float(
             preview.detail_ignore_threshold
         ),
+        "target_object_uuid": str(preview.target_object_uuid),
+        "frontface_epsilon": float(preview.frontface_epsilon),
+        "max_projection_distance": float(
+            preview.max_projection_distance
+        ),
+        "max_surface_step": float(preview.max_surface_step),
+        "normal_continuity_cos": float(
+            preview.normal_continuity_cos
+        ),
+        "flat_target_tolerance": float(
+            preview.flat_target_tolerance
+        ),
+        "validation_metrics": {
+            str(key): (
+                int(value)
+                if str(key) == "normal_flip_count"
+                else float(value)
+            )
+            for key, value in preview.validation_metrics.items()
+        },
         "state": "PARAMETRIC",
         "revision": 1,
         "topology_kind": topology_kind,
@@ -3746,6 +4116,24 @@ def _committed_grid_previews(
                 record.get("detail_ignore_threshold", 0.0)
             ),
             boundary_registry=boundary_registry,
+            target_object_uuid=str(
+                record.get("target_object_uuid", "")
+            ),
+            frontface_epsilon=float(
+                record.get("frontface_epsilon", 0.001)
+            ),
+            max_projection_distance=float(
+                record.get("max_projection_distance", 0.0)
+            ),
+            max_surface_step=float(
+                record.get("max_surface_step", 0.0)
+            ),
+            normal_continuity_cos=float(
+                record.get("normal_continuity_cos", -0.05)
+            ),
+            flat_target_tolerance=float(
+                record.get("flat_target_tolerance", 0.0005)
+            ),
         )
         previews.append(preview)
     return previews
@@ -3903,6 +4291,9 @@ def synchronize_guides_from_mesh(
     projector,
     target_object_uuid,
     normal_offset=0.0,
+    max_projection_distance=0.0,
+    max_surface_step=0.0,
+    normal_continuity_cos=-0.05,
     force=False,
 ):
     staged_cells, decisions, uid_map = audit_built_cell_sync(
@@ -4027,6 +4418,9 @@ def synchronize_guides_from_mesh(
         projector,
         target_object_uuid,
         normal_offset=normal_offset,
+        max_projection_distance=max_projection_distance,
+        max_surface_step=max_surface_step,
+        normal_continuity_cos=normal_continuity_cos,
     )
     guide_snapshot = clone_guides(guides)
     had_guide_property = GUIDE_DATA_KEY in obj

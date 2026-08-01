@@ -184,6 +184,76 @@ class FLOWPATCH_PG_settings(PropertyGroup):
         subtype="DISTANCE",
         unit="LENGTH",
     )
+    frontface_epsilon: FloatProperty(
+        name="Front-Face Epsilon",
+        description="Reject pointer hits that face away from the current view",
+        default=0.001,
+        min=0.0,
+        soft_max=0.1,
+        precision=4,
+    )
+    max_projection_distance: FloatProperty(
+        name="Max Projection Distance",
+        description=(
+            "Maximum candidate-to-surface distance; zero uses a target-size "
+            "adaptive limit"
+        ),
+        default=0.0,
+        min=0.0,
+        soft_max=1.0,
+        precision=4,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+    max_surface_step: FloatProperty(
+        name="Max Surface Step",
+        description=(
+            "Maximum same-side anchor movement per preview update; zero uses "
+            "a target-size adaptive limit"
+        ),
+        default=0.0,
+        min=0.0,
+        soft_max=1.0,
+        precision=4,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+    normal_continuity_cos: FloatProperty(
+        name="Normal Continuity",
+        description=(
+            "Minimum normal cosine for same-side continuity; the default "
+            "allows a ninety-degree hard corner but rejects an opposite side"
+        ),
+        default=-0.05,
+        min=-1.0,
+        max=1.0,
+        precision=3,
+    )
+    guide_fair_strength: FloatProperty(
+        name="Guide Fair Strength",
+        description="Tangential guide fairing strength per iteration",
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+    guide_fair_iterations: IntProperty(
+        name="Guide Fair Iterations",
+        description="Number of tangent-fair and same-side reprojection passes",
+        default=2,
+        min=1,
+        max=12,
+    )
+    flat_target_tolerance: FloatProperty(
+        name="Flat Target Tolerance",
+        description="Maximum permitted patch deviation when its boundary is planar",
+        default=0.0005,
+        min=0.000001,
+        soft_max=0.01,
+        precision=6,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
     surface_offset: FloatProperty(
         name="Offset",
         description="World-space distance applied along the target normal",

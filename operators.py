@@ -64,6 +64,7 @@ from .guides import build_uncommitted_previews
 from .guides import commit_guide_patches
 from .guides import detach_frozen_sync
 from .guides import find_bounded_regions
+from .guides import fair_guides_tangent
 from .guides import GUIDE_DATA_KEY
 from .guides import guides_world
 from .guides import load_built_cells
@@ -979,6 +980,14 @@ def _resolved_projection(settings):
     return "RAW", 1.0
 
 
+def _continuity_kwargs(settings):
+    return {
+        "max_projection_distance": float(settings.max_projection_distance),
+        "max_surface_step": float(settings.max_surface_step),
+        "normal_continuity_cos": float(settings.normal_continuity_cos),
+    }
+
+
 def _closest_point_2d(point, start, end):
     point = Vector(point)
     start = Vector(start)
@@ -1718,6 +1727,16 @@ def _session_debug_state(
         "validation_errors": list(
             getattr(session, "_validation_errors", None) or ()
         ),
+        "preview_validation_metrics": [
+            {
+                "cycle_key": str(preview.cycle_key),
+                "validation_status": str(preview.validation_status),
+                **dict(preview.validation_metrics or {}),
+            }
+            for preview in tuple(
+                getattr(session, "_previews", None) or ()
+            )[:8]
+        ],
         "pen_state": (
             state.snapshot()
             if state is not None
@@ -3409,6 +3428,7 @@ class FLOWPATCH_OT_guide_session(Operator):
     _density_overrides = None
     _stroke_world = None
     _stroke_screen = None
+    _stroke_anchors = None
     _stroke_filter_mouse = None
     _stroke_event_mouse = None
     _pen_state = None
@@ -3443,6 +3463,7 @@ class FLOWPATCH_OT_guide_session(Operator):
     _transform_tangent_normal = None
     _transform_temporary_selection = False
     _transform_return_mode = ""
+    _transform_projection_rejected = False
     _history = None
     _redo_history = None
     _move_snapshot = None
@@ -3634,21 +3655,49 @@ class FLOWPATCH_OT_guide_session(Operator):
             self._stroke_world[index].copy()
             for index in retained_indices
         ]
+        retained_anchors = (
+            [self._stroke_anchors[index].copy() for index in retained_indices]
+            if len(self._stroke_anchors or ()) == len(self._stroke_world)
+            else [None for _index in retained_indices]
+        )
 
+        target_uuid = str(self._target_object_uuid)
         world = []
+        anchors = []
+        previous_anchor = None
         for index, point in enumerate(smoothed):
-            hit = self._projector.raycast_region(
+            seed_anchor = retained_anchors[index] or previous_anchor
+            hit = self._projector.raycast_region_continuous(
                 self._region,
                 self._region_3d,
                 point,
-                settings.surface_offset,
+                target_object_uuid=target_uuid,
+                previous_anchor=seed_anchor,
+                surface_offset=settings.surface_offset,
+                frontface_epsilon=settings.frontface_epsilon,
+                max_surface_step=settings.max_surface_step,
+                normal_continuity_cos=settings.normal_continuity_cos,
             )
-            world.append(
-                Vector(hit[0])
-                if hit is not None
-                else fallback_world[index]
-            )
-        world = _filter_guide_world_by_view(
+            if hit is not None:
+                point_world = Vector(hit[0])
+                anchor = hit[4].copy()
+            else:
+                anchor = retained_anchors[index]
+                resolved = (
+                    self._projector.world_from_anchor(anchor)
+                    if anchor is not None
+                    else None
+                )
+                point_world = (
+                    Vector(resolved[0])
+                    if resolved is not None
+                    else fallback_world[index].copy()
+                )
+            world.append(point_world)
+            anchors.append(anchor.copy() if anchor is not None else None)
+            if anchor is not None:
+                previous_anchor = anchor
+        filtered_world = _filter_guide_world_by_view(
             world,
             smoothed,
             self._region,
@@ -3659,9 +3708,43 @@ class FLOWPATCH_OT_guide_session(Operator):
             surface_smoothing_radius=settings.surface_smoothing_radius,
             detail_ignore_threshold=settings.detail_ignore_threshold,
         )
+        final_world = []
+        final_anchors = []
+        previous_anchor = None
+        for index, candidate_world in enumerate(filtered_world):
+            seed_anchor = anchors[index] or previous_anchor
+            nearest = self._projector.nearest_world_continuous(
+                candidate_world,
+                target_object_uuid=target_uuid,
+                previous_anchor=seed_anchor,
+                surface_offset=settings.surface_offset,
+                **_continuity_kwargs(settings),
+            )
+            if nearest is not None:
+                point_world = Vector(nearest[0])
+                anchor = nearest[4].copy()
+            else:
+                anchor = anchors[index]
+                resolved = (
+                    self._projector.world_from_anchor(anchor)
+                    if anchor is not None
+                    else None
+                )
+                point_world = (
+                    Vector(resolved[0])
+                    if resolved is not None
+                    else world[index].copy()
+                )
+            final_world.append(point_world)
+            final_anchors.append(
+                anchor.copy() if anchor is not None else None
+            )
+            if anchor is not None:
+                previous_anchor = anchor
         self._stroke_screen = smoothed
-        self._stroke_world = world
-        self._renderer.stroke = list(world)
+        self._stroke_world = final_world
+        self._stroke_anchors = final_anchors
+        self._renderer.stroke = list(final_world)
 
     def _bounded_snap_radius(self, radius_px):
         return min(
@@ -3958,14 +4041,14 @@ class FLOWPATCH_OT_guide_session(Operator):
             raise FlowPatchGeometryError(
                 "The projection target has no stable object UUID."
             )
+        settings = self._scene.flowpatch_retopo
         return refresh_guide_surface_anchors(
             self._retopo,
             self._guides or [],
             self._projector,
             target_uuid,
-            normal_offset=float(
-                self._scene.flowpatch_retopo.surface_offset
-            ),
+            normal_offset=float(settings.surface_offset),
+            **_continuity_kwargs(settings),
         )
 
     def _sync_state_counts(self):
@@ -4079,6 +4162,7 @@ class FLOWPATCH_OT_guide_session(Operator):
                 normal_offset=float(
                     self._scene.flowpatch_retopo.surface_offset
                 ),
+                **_continuity_kwargs(self._scene.flowpatch_retopo),
                 force=force,
             )
         except (FlowPatchGeometryError, RuntimeError, ValueError) as exc:
@@ -4217,6 +4301,9 @@ class FLOWPATCH_OT_guide_session(Operator):
 
     def _append_surface_sample(self, context, event, force=False):
         settings = context.scene.flowpatch_retopo
+        target_uuid = str(self._target_object_uuid)
+        if self._stroke_anchors is None:
+            self._stroke_anchors = []
         raw_mouse = self._region_mouse(event)
         mouse = self._stabilized_mouse(raw_mouse)
         had_projection_gap = bool(self._stroke_had_projection_gap)
@@ -4224,11 +4311,18 @@ class FLOWPATCH_OT_guide_session(Operator):
         spacing = max(1.0, float(settings.sample_spacing_px))
         interpolation_step = max(2.0, min(8.0, spacing * 0.5))
         max_bridge_distance = max(18.0, spacing * 3.0)
-        current_hit = self._projector.raycast_region(
+        current_hit = self._projector.raycast_region_continuous(
             self._region,
             self._region_3d,
             mouse,
-            settings.surface_offset,
+            target_object_uuid=target_uuid,
+            previous_anchor=(
+                self._stroke_anchors[-1] if self._stroke_anchors else None
+            ),
+            surface_offset=settings.surface_offset,
+            frontface_epsilon=settings.frontface_epsilon,
+            max_surface_step=settings.max_surface_step,
+            normal_continuity_cos=settings.normal_continuity_cos,
         )
         if current_hit is None:
             if not had_projection_gap:
@@ -4278,11 +4372,20 @@ class FLOWPATCH_OT_guide_session(Operator):
                     "FlowPatch stopped this stroke at its safety sample limit.",
                 )
                 break
-            hit = self._projector.raycast_region(
+            hit = self._projector.raycast_region_continuous(
                 self._region,
                 self._region_3d,
                 candidate,
-                settings.surface_offset,
+                target_object_uuid=target_uuid,
+                previous_anchor=(
+                    self._stroke_anchors[-1]
+                    if self._stroke_anchors
+                    else None
+                ),
+                surface_offset=settings.surface_offset,
+                frontface_epsilon=settings.frontface_epsilon,
+                max_surface_step=settings.max_surface_step,
+                normal_continuity_cos=settings.normal_continuity_cos,
             )
             if hit is None:
                 if not self._stroke_had_projection_gap:
@@ -4313,6 +4416,7 @@ class FLOWPATCH_OT_guide_session(Operator):
 
             self._stroke_screen.append(candidate.copy())
             self._stroke_world.append(Vector(hit[0]))
+            self._stroke_anchors.append(hit[4].copy())
             self._stroke_event_mouse = candidate.copy()
             _pen_projected_sample(self)
             appended = True
@@ -4927,6 +5031,12 @@ class FLOWPATCH_OT_guide_session(Operator):
                 detail_ignore_threshold=settings.detail_ignore_threshold,
                 validation_errors=validation_errors,
                 density_overrides=self._density_overrides,
+                target_object_uuid=str(self._target_object_uuid),
+                frontface_epsilon=settings.frontface_epsilon,
+                max_projection_distance=settings.max_projection_distance,
+                max_surface_step=settings.max_surface_step,
+                normal_continuity_cos=settings.normal_continuity_cos,
+                flat_target_tolerance=settings.flat_target_tolerance,
             )
         except GuideGraphBudgetError as exc:
             message = str(exc)
@@ -4948,6 +5058,23 @@ class FLOWPATCH_OT_guide_session(Operator):
                 self._last_preview_warning = message
             self._update_renderer()
             return False
+        rejected_projection_keys = {
+            str(cycle_key)
+            for cycle_key, message in validation_errors
+            if "REJECTED_PROJECTION" in str(message)
+        }
+        preview_keys = {str(preview.cycle_key) for preview in previews}
+        for previous in previous_previews:
+            cycle_key = str(previous.cycle_key)
+            if (
+                cycle_key not in rejected_projection_keys
+                or cycle_key in preview_keys
+            ):
+                continue
+            retained = deepcopy(previous)
+            retained.validation_status = "REJECTED_PROJECTION"
+            previews.append(retained)
+            preview_keys.add(cycle_key)
         self._previews = previews
         self._validation_errors = validation_errors
         SESSION_BREADCRUMBS.record(
@@ -5111,6 +5238,7 @@ class FLOWPATCH_OT_guide_session(Operator):
     def _clear_stroke(self):
         self._stroke_world = []
         self._stroke_screen = []
+        self._stroke_anchors = []
         self._stroke_filter_mouse = None
         self._stroke_event_mouse = None
         self._stroke_endpoint_nodes = [0, 0]
@@ -5176,12 +5304,49 @@ class FLOWPATCH_OT_guide_session(Operator):
         )
         return True
 
-    def _project_transform_world(self, context, point_world):
-        nearest = self._projector.nearest_world(
+    def _anchor_for_ref(self, ref):
+        guide_index, point_index = ref
+        guide = self._guides[guide_index]
+        if len(guide.anchors) != len(guide.points_local):
+            return None
+        return guide.anchors[point_index]
+
+    def _set_anchor_for_ref(self, ref, anchor):
+        if anchor is None:
+            return
+        guide_index, point_index = ref
+        guide = self._guides[guide_index]
+        if len(guide.anchors) != len(guide.points_local):
+            return
+        anchors = list(guide.anchors)
+        anchors[point_index] = anchor.copy()
+        guide.anchors = tuple(anchors)
+
+    def _project_transform_world(self, context, point_world, ref):
+        settings = context.scene.flowpatch_retopo
+        previous_anchor = self._anchor_for_ref(ref)
+        nearest = self._projector.nearest_world_continuous(
             point_world,
-            context.scene.flowpatch_retopo.surface_offset,
+            target_object_uuid=str(self._target_object_uuid),
+            previous_anchor=previous_anchor,
+            surface_offset=settings.surface_offset,
+            **_continuity_kwargs(settings),
         )
-        return Vector(nearest[0]) if nearest is not None else Vector(point_world)
+        if nearest is not None:
+            self._set_anchor_for_ref(ref, nearest[4])
+            return Vector(nearest[0])
+        self._transform_projection_rejected = True
+        last_valid = (
+            self._projector.world_from_anchor(previous_anchor)
+            if previous_anchor is not None
+            else None
+        )
+        if last_valid is not None:
+            return Vector(last_valid[0])
+        return Vector(
+            self._retopo.matrix_world
+            @ self._guides[ref[0]].points_local[ref[1]]
+        )
 
     def _hover_transform_refs(self, hit):
         if not isinstance(hit, dict):
@@ -5301,10 +5466,21 @@ class FLOWPATCH_OT_guide_session(Operator):
             and "point_world" in hover_hit
             else center_world
         )
-        surface_anchor = self._projector.nearest_world(
-            anchor_world,
-            context.scene.flowpatch_retopo.surface_offset,
+        seed_anchor = self._anchor_for_ref(refs[0])
+        surface_anchor = (
+            self._projector.world_from_anchor(seed_anchor)
+            if seed_anchor is not None
+            else None
         )
+        if surface_anchor is None:
+            settings = context.scene.flowpatch_retopo
+            surface_anchor = self._projector.nearest_world_continuous(
+                anchor_world,
+                target_object_uuid=str(self._target_object_uuid),
+                previous_anchor=None,
+                surface_offset=settings.surface_offset,
+                **_continuity_kwargs(settings),
+            )
         if surface_anchor is None:
             self.report(
                 {"WARNING"},
@@ -5356,6 +5532,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._transform_tangent_normal = tangent_normal
         self._transform_temporary_selection = decision.temporary
         self._transform_return_mode = self._mode
+        self._transform_projection_rejected = False
         self._exit_armed = False
         self._clear_hover_feedback("TRANSFORM_START")
         self._set_status(
@@ -5371,6 +5548,7 @@ class FLOWPATCH_OT_guide_session(Operator):
     def _apply_transform_event(self, context, event):
         if not self._transform_mode or not self._transform_refs:
             return False
+        self._transform_projection_rejected = False
         mouse = self._region_mouse(event)
         transformed = {}
         mode = self._transform_mode
@@ -5430,9 +5608,26 @@ class FLOWPATCH_OT_guide_session(Operator):
         inverse = self._retopo.matrix_world.inverted_safe()
         for ref, point_world in transformed.items():
             guide_index, point_index = ref
-            projected = self._project_transform_world(context, point_world)
+            projected = self._project_transform_world(
+                context,
+                point_world,
+                ref,
+            )
             self._guides[guide_index].points_local[point_index] = (
                 inverse @ projected
+            )
+        if self._transform_projection_rejected:
+            self._set_status(
+                context,
+                "FlowPatch: REJECTED_PROJECTION; holding last valid preview",
+            )
+        else:
+            self._set_status(
+                context,
+                (
+                    f"FlowPatch {mode.title()}: move pointer; "
+                    "left click/Enter confirms, right click/Esc cancels"
+                ),
             )
         self._rebuild_previews()
         return True
@@ -5448,6 +5643,7 @@ class FLOWPATCH_OT_guide_session(Operator):
         self._transform_tangent_normal = None
         self._transform_temporary_selection = False
         self._transform_return_mode = ""
+        self._transform_projection_rejected = False
 
     def _rollback_transform_state(self, rebuild=True):
         if not self._transform_mode or self._transform_snapshot is None:
@@ -5477,6 +5673,16 @@ class FLOWPATCH_OT_guide_session(Operator):
         snapshot = self._transform_snapshot
         temporary = bool(self._transform_temporary_selection)
         return_mode = self._transform_return_mode or self._mode
+        if self._transform_projection_rejected:
+            self._restore_rejected_guide_edit(snapshot)
+            self._mode = return_mode
+            self._clear_transform_state()
+            self._rebuild_previews()
+            self._set_status(
+                context,
+                "FlowPatch: REJECTED_PROJECTION; transform rolled back",
+            )
+            return True
         changed_guide_ids = self._changed_guide_ids_from_snapshot(snapshot)
         sync_result = self._sync_mesh_from_current_guides(
             changed_guide_ids=changed_guide_ids,
@@ -5505,18 +5711,31 @@ class FLOWPATCH_OT_guide_session(Operator):
     def _move_selected_to_event(self, context, event, isolated=False):
         if self._selected_control is None:
             return False
-        hit = self._projector.raycast_region(
+        guide_index, point_index = self._selected_control
+        settings = context.scene.flowpatch_retopo
+        hit = self._projector.raycast_region_continuous(
             self._region,
             self._region_3d,
             self._region_mouse(event),
-            context.scene.flowpatch_retopo.surface_offset,
+            target_object_uuid=str(self._target_object_uuid),
+            previous_anchor=self._anchor_for_ref(
+                (guide_index, point_index)
+            ),
+            surface_offset=settings.surface_offset,
+            frontface_epsilon=settings.frontface_epsilon,
+            max_surface_step=settings.max_surface_step,
+            normal_continuity_cos=settings.normal_continuity_cos,
         )
         if hit is None:
+            self._set_status(
+                context,
+                "FlowPatch: REJECTED_PROJECTION; keeping last valid control",
+            )
             return False
 
-        guide_index, point_index = self._selected_control
         guide = self._guides[guide_index]
         new_local = self._retopo.matrix_world.inverted_safe() @ Vector(hit[0])
+        new_anchor = hit[4].copy()
         node_id = 0
         if point_index == 0:
             node_id = int(guide.start_node)
@@ -5525,53 +5744,91 @@ class FLOWPATCH_OT_guide_session(Operator):
 
         original_local = guide.points_local[point_index].copy()
         delta_local = new_local - original_local
-        settings = context.scene.flowpatch_retopo
 
-        def projected_local(point_local):
-            nearest = self._projector.nearest_world(
+        def projected_local(ref, point_local):
+            previous_anchor = self._anchor_for_ref(ref)
+            nearest = self._projector.nearest_world_continuous(
                 self._retopo.matrix_world @ point_local,
-                settings.surface_offset,
+                target_object_uuid=str(self._target_object_uuid),
+                previous_anchor=previous_anchor,
+                surface_offset=settings.surface_offset,
+                **_continuity_kwargs(settings),
             )
             if nearest is None:
-                return point_local
+                return None
+            self._set_anchor_for_ref(ref, nearest[4])
             return (
                 self._retopo.matrix_world.inverted_safe()
                 @ Vector(nearest[0])
             )
 
-        def move_nearby(candidate, anchor_index):
+        def move_nearby(candidate_index, anchor_index):
+            candidate = self._guides[candidate_index]
             radius = max(2, min(6, len(candidate.points_local) // 3))
-            for candidate_index in range(1, len(candidate.points_local) - 1):
-                distance = abs(candidate_index - anchor_index)
+            source = [point.copy() for point in candidate.points_local]
+            for local_index in range(1, len(source) - 1):
+                distance = abs(local_index - anchor_index)
                 if distance > radius:
                     continue
                 factor = 1.0 - (distance / (radius + 1.0))
                 factor = factor * factor * (3.0 - 2.0 * factor)
                 moved = (
-                    candidate.points_local[candidate_index]
+                    source[local_index]
                     + delta_local * factor
                 )
-                candidate.points_local[candidate_index] = projected_local(moved)
+                projected = projected_local(
+                    (candidate_index, local_index),
+                    moved,
+                )
+                if projected is not None:
+                    candidate.points_local[local_index] = projected
 
         if isolated and node_id:
-            for candidate in self._guides:
+            for candidate_index, candidate in enumerate(self._guides):
                 if candidate.start_node == node_id:
                     candidate.points_local[0] = new_local.copy()
+                    self._set_anchor_for_ref(
+                        (candidate_index, 0),
+                        new_anchor,
+                    )
                 if candidate.end_node == node_id:
                     candidate.points_local[-1] = new_local.copy()
+                    self._set_anchor_for_ref(
+                        (candidate_index, len(candidate.points_local) - 1),
+                        new_anchor,
+                    )
         elif isolated:
             guide.points_local[point_index] = new_local.copy()
+            self._set_anchor_for_ref(
+                (guide_index, point_index),
+                new_anchor,
+            )
         elif node_id:
-            for candidate in self._guides:
+            for candidate_index, candidate in enumerate(self._guides):
                 if candidate.start_node == node_id:
                     candidate.points_local[0] = new_local.copy()
-                    move_nearby(candidate, 0)
+                    self._set_anchor_for_ref(
+                        (candidate_index, 0),
+                        new_anchor,
+                    )
+                    move_nearby(candidate_index, 0)
                 if candidate.end_node == node_id:
                     candidate.points_local[-1] = new_local.copy()
-                    move_nearby(candidate, len(candidate.points_local) - 1)
+                    self._set_anchor_for_ref(
+                        (candidate_index, len(candidate.points_local) - 1),
+                        new_anchor,
+                    )
+                    move_nearby(
+                        candidate_index,
+                        len(candidate.points_local) - 1,
+                    )
         else:
-            move_nearby(guide, point_index)
+            move_nearby(guide_index, point_index)
             guide.points_local[point_index] = new_local.copy()
+            self._set_anchor_for_ref(
+                (guide_index, point_index),
+                new_anchor,
+            )
         self._rebuild_previews()
         return True
 
@@ -5596,31 +5853,56 @@ class FLOWPATCH_OT_guide_session(Operator):
             )
             return
 
+        try:
+            cycles, _edge_nodes, _guide_by_id = find_bounded_regions(
+                self._retopo,
+                self._guides,
+                self._projector,
+            )
+        except (FlowPatchGeometryError, GuideGraphBudgetError) as exc:
+            self.report({"WARNING"}, f"Relax stopped: {exc}")
+            return
+        edge_use_count = {}
+        for cycle in cycles:
+            for edge_id in cycle.edge_ids:
+                edge_use_count[int(edge_id)] = (
+                    edge_use_count.get(int(edge_id), 0) + 1
+                )
+        shared_guide_ids = {
+            edge_id for edge_id, count in edge_use_count.items() if count > 1
+        }
+        guide_indices = [
+            index
+            for index in guide_indices
+            if int(self._guides[index].guide_id) not in shared_guide_ids
+        ]
+        if not guide_indices:
+            self.report(
+                {"INFO"},
+                "Shared patch boundaries stay pinned during Relax.",
+            )
+            return
+
         self._push_history()
-        settings = context.scene.flowpatch_retopo
-        for guide_index in guide_indices:
-            guide = self._guides[guide_index]
-            if len(guide.points_local) < 3:
-                continue
-            source = [point.copy() for point in guide.points_local]
-            for point_index in range(1, len(source) - 1):
-                smoothed = (
-                    source[point_index] * 0.5
-                    + source[point_index - 1] * 0.25
-                    + source[point_index + 1] * 0.25
-                )
-                world = self._retopo.matrix_world @ smoothed
-                nearest = self._projector.nearest_world(
-                    world,
-                    settings.surface_offset,
-                )
-                if nearest is not None:
-                    smoothed = (
-                        self._retopo.matrix_world.inverted_safe()
-                        @ Vector(nearest[0])
-                    )
-                guide.points_local[point_index] = smoothed
         snapshot = self._history[-1]
+        settings = context.scene.flowpatch_retopo
+        try:
+            fair_guides_tangent(
+                self._retopo,
+                self._guides,
+                guide_indices,
+                self._projector,
+                str(self._target_object_uuid),
+                strength=settings.guide_fair_strength,
+                iterations=settings.guide_fair_iterations,
+                surface_offset=settings.surface_offset,
+                **_continuity_kwargs(settings),
+            )
+        except FlowPatchGeometryError as exc:
+            self._restore_rejected_guide_edit(snapshot)
+            self._rebuild_previews()
+            self.report({"WARNING"}, str(exc))
+            return
         changed_guide_ids = self._changed_guide_ids_from_snapshot(snapshot)
         if self._sync_mesh_from_current_guides(
             changed_guide_ids=changed_guide_ids,
@@ -5842,6 +6124,19 @@ class FLOWPATCH_OT_guide_session(Operator):
                 )
             else:
                 selected_previews = [active_preview]
+
+        rejected_previews = [
+            preview
+            for preview in selected_previews
+            if str(preview.validation_status).upper() != "VALID"
+        ]
+        if rejected_previews:
+            self.report(
+                {"WARNING"},
+                "Build stopped: REJECTED_PROJECTION retained the last valid "
+                "preview without committing it.",
+            )
+            return False
 
         bm = bmesh.from_edit_mesh(self._retopo.data)
         rollback_mesh = None
@@ -6314,6 +6609,7 @@ class FLOWPATCH_OT_guide_session(Operator):
             self._previews = []
             self._stroke_world = []
             self._stroke_screen = []
+            self._stroke_anchors = []
             self._stroke_filter_mouse = None
             self._stroke_event_mouse = None
             self._stroke_endpoint_nodes = [0, 0]

@@ -37,6 +37,7 @@ class SurfaceAnchor:
     )
     normal_offset: float = 0.0
     topology_revision: int = 0
+    shell_component: int = -1
 
     def copy(self):
         return SurfaceAnchor(
@@ -48,6 +49,7 @@ class SurfaceAnchor:
             local_normal=self.local_normal.copy(),
             normal_offset=float(self.normal_offset),
             topology_revision=int(self.topology_revision),
+            shell_component=int(self.shell_component),
         )
 
     def interpolated(self, other, factor):
@@ -80,6 +82,11 @@ class SurfaceAnchor:
             topology_revision=max(
                 int(self.topology_revision),
                 int(other.topology_revision),
+            ),
+            shell_component=(
+                int(self.shell_component)
+                if int(self.shell_component) == int(other.shell_component)
+                else -1
             ),
         )
 
@@ -862,6 +869,17 @@ def oriented_edge_points(guide, start_node, end_node):
     raise ValueError("Guide edge is not connected to the requested nodes.")
 
 
+def oriented_edge_anchors(guide, start_node, end_node):
+    if len(guide.anchors) != len(guide.points_local):
+        return []
+    actual_start, actual_end = _edge_nodes(guide)
+    if (actual_start, actual_end) == (start_node, end_node):
+        return [anchor.copy() for anchor in guide.anchors]
+    if (actual_end, actual_start) == (start_node, end_node):
+        return [anchor.copy() for anchor in reversed(guide.anchors)]
+    raise ValueError("Guide edge is not connected to the requested nodes.")
+
+
 def oriented_side_points(side, guide_by_id):
     points = []
     current = side.start_node
@@ -882,6 +900,30 @@ def oriented_side_points(side, guide_by_id):
     if current != side.end_node:
         raise ValueError("Logical guide side ends at the wrong graph node.")
     return points
+
+
+def oriented_side_anchors(side, guide_by_id):
+    anchors = []
+    current = side.start_node
+    for edge_id in side.edge_ids:
+        guide = guide_by_id[edge_id]
+        start, end = _edge_nodes(guide)
+        if start == current:
+            following = end
+        elif end == current:
+            following = start
+        else:
+            raise ValueError("Logical guide side has inconsistent connectivity.")
+        edge_anchors = oriented_edge_anchors(guide, current, following)
+        if not edge_anchors:
+            return []
+        if anchors:
+            edge_anchors = edge_anchors[1:]
+        anchors.extend(edge_anchors)
+        current = following
+    if current != side.end_node:
+        raise ValueError("Logical guide side ends at the wrong graph node.")
+    return anchors
 
 
 def with_normalized_winding(cycle, reverse, target_local_area):
