@@ -18,6 +18,7 @@ from .build_identity import BUILD_ID
 from .build_identity import PACKAGE_PAYLOAD_HASH_SCOPE
 from .build_identity import PACKAGE_PAYLOAD_SHA256
 from .build_identity import SOURCE_BRANCH
+from .binding_registry import foundation_status
 from .auto_build import AutoBuildPlanError
 from .auto_build import plan_auto_build
 from .diagnostics import build_debug_document
@@ -1528,6 +1529,7 @@ def _build_identity_state():
             == os.path.normcase(installed_extension_resolved_path)
         ),
         "project_schema_version": PROJECT_SCHEMA_VERSION,
+        "binding_foundation": foundation_status(),
     }
 
 
@@ -4940,6 +4942,16 @@ class FLOWPATCH_OT_guide_session(Operator):
             or self._selected_control is not None
         )
         has_single_cell = len(self._previews or []) == 1
+        active_preview = None
+        if self._previews and 0 <= self._active_preview_index < len(
+            self._previews
+        ):
+            active_preview = self._previews[self._active_preview_index]
+        has_active_valid_grid = bool(
+            active_preview is not None
+            and str(active_preview.validation_status).upper() == "VALID"
+            and str(active_preview.topology_kind).upper() == "GRID"
+        )
         capability_context = context or getattr(bpy, "context", None)
         has_selected_boundary = False
         if capability_context is not None:
@@ -4971,16 +4983,10 @@ class FLOWPATCH_OT_guide_session(Operator):
                 ("retained_guide",),
             ),
             "BUILD": when(
-                has_cells,
-                "VALID_CELL_REQUIRED",
-                "Close a valid guide cell before building.",
-                ("valid_pending_cell",),
-            ),
-            "DISSOLVE": when(
-                has_cells,
-                "VALID_CELL_REQUIRED",
-                "Close a valid guide cell before dissolving.",
-                ("valid_pending_cell",),
+                has_active_valid_grid,
+                "ACTIVE_VALID_GRID_REQUIRED",
+                "Build requires one active valid four-sided GRID preview.",
+                ("active_valid_grid_preview",),
             ),
             "CUT": when(
                 has_guides and not has_built_cells,
@@ -4988,16 +4994,6 @@ class FLOWPATCH_OT_guide_session(Operator):
                 "Cut Guides is available only before patch cells are committed.",
                 ("retained_guides", "no_committed_cells"),
                 state="EXPERIMENTAL",
-            ),
-            "TRIM": CapabilityResult.disabled(
-                "DEFERRED_BATCH_17_TRIM_REFLOW",
-                "Trim is disabled until welded boundary reflow is implemented.",
-                ("trim_reflow",),
-            ),
-            "LOOP_CUT": CapabilityResult.disabled(
-                "DEFERRED_BATCH_13_CONTOUR_TOOL",
-                "Loop/Contour is disabled until the projected contour workflow is implemented.",
-                ("line_project_contour",),
             ),
             "SURFACE_FOLLOW": when(
                 has_single_cell,
@@ -5093,19 +5089,10 @@ class FLOWPATCH_OT_guide_session(Operator):
             _toolbar_item(
                 "BUILD",
                 "03_build_quad_patch.png",
-                "Build Patch: retry the active valid guide cell as durable mesh",
+                "Build Active GRID: commit the active valid four-sided cell",
                 enabled=capability("BUILD").enabled,
                 priority="PRIMARY",
                 disabled_reason=capability("BUILD").message,
-            ),
-            _toolbar_item(
-                "DISSOLVE",
-                "20_adjacent_shared_cells.png",
-                "Dissolve Patch: commit the connected guide cells as one welded "
-                "quad patch while retaining their internal quad loops",
-                enabled=capability("DISSOLVE").enabled,
-                priority="PRIMARY",
-                disabled_reason=capability("DISSOLVE").message,
             ),
             _toolbar_item(
                 "CUT",
@@ -5115,22 +5102,6 @@ class FLOWPATCH_OT_guide_session(Operator):
                 active=self._mode == "CUT",
                 priority="PRIMARY",
                 disabled_reason=capability("CUT").message,
-            ),
-            _toolbar_item(
-                "TRIM",
-                "12_cut_trim.png",
-                "Trim: remove a selected side and rebuild its welded quad boundary",
-                enabled=capability("TRIM").enabled,
-                priority="PRIMARY",
-                disabled_reason=capability("TRIM").message,
-            ),
-            _toolbar_item(
-                "LOOP_CUT",
-                "04_loop_cut.png",
-                "Loop Cut: leave the guide session and start the committed-patch loop-cut tool",
-                enabled=capability("LOOP_CUT").enabled,
-                priority="PRIMARY",
-                disabled_reason=capability("LOOP_CUT").message,
             ),
             _toolbar_item(
                 "SURFACE_FOLLOW",
@@ -6681,6 +6652,19 @@ class FLOWPATCH_OT_guide_session(Operator):
                 "preview without committing it.",
             )
             return False
+        unsupported_previews = [
+            preview
+            for preview in selected_previews
+            if str(preview.topology_kind).upper() != "GRID"
+        ]
+        if unsupported_previews:
+            self.report(
+                {"WARNING"},
+                "Build stopped: CR-00 supports only deterministic "
+                "four-sided GRID previews. Other contours stay as guides "
+                "until CR-03/CR-04.",
+            )
+            return False
 
         bm = bmesh.from_edit_mesh(self._retopo.data)
         rollback_mesh = None
@@ -6909,15 +6893,6 @@ class FLOWPATCH_OT_guide_session(Operator):
         if action == "BUILD":
             self._commit_ready_cells(context)
             return "KEEP"
-        if action == "DISSOLVE":
-            self._commit_ready_cells(context, dissolve=True)
-            return "KEEP"
-        if action == "LOOP_CUT":
-            self._preserve_guides()
-            self._stop_requested = True
-            self._cleanup(context)
-            bpy.ops.flowpatch.loop_cut_patch("INVOKE_DEFAULT")
-            return "FINISH"
         if action == "SURFACE_FOLLOW":
             self._scene.flowpatch_retopo.projection_mode = "RAW"
             self._rebuild_previews()

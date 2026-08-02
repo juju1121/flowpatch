@@ -185,9 +185,9 @@ result = operators.FLOWPATCH_OT_copy_debug_state.execute(
 assert result == {"FINISHED"}
 copied = json.loads(debug_context.window_manager.clipboard)
 assert copied["project_object_found"] is False
-assert copied["build_identity"]["addon_version"] == "1.4.19"
+assert copied["build_identity"]["addon_version"] == "1.4.21"
 assert copied["build_identity"]["build_id"] == (
-    "recovery-r1-guide-interaction-20260801"
+    "core-reset-cr00-20260802"
 )
 assert copied["build_identity"]["active_source_path"].endswith(
     "operators.py"

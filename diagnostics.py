@@ -155,11 +155,8 @@ TOOL_REGISTRY = ToolRegistry(
     (
         ToolSpec("DRAW", "always"),
         ToolSpec("EDIT", "has_retained_guides"),
-        ToolSpec("BUILD", "has_valid_pending_cells", "LIMITED"),
-        ToolSpec("DISSOLVE", "has_valid_pending_cells", "LIMITED"),
+        ToolSpec("BUILD", "has_active_valid_grid_cell", "LIMITED"),
         ToolSpec("CUT", "has_uncommitted_guide_network", "EXPERIMENTAL"),
-        ToolSpec("TRIM", "deferred_batch_17", "DISABLED"),
-        ToolSpec("LOOP_CUT", "deferred_batch_13", "DISABLED"),
         ToolSpec("SURFACE_FOLLOW", "has_one_pending_cell", "LIMITED"),
         ToolSpec("SURFACE_TIGHTEN", "has_one_pending_cell", "LIMITED"),
         ToolSpec("BOUNDARY", "has_selected_open_mesh_boundary", "EXPERIMENTAL"),

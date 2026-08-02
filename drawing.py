@@ -253,9 +253,10 @@ class FlowPatchPreviewRenderer:
         x, y = mouse_region
         for identifier, (left, bottom, right, top) in self._toolbar_rects.items():
             if left <= x <= right and bottom <= y <= top:
-                if self._toolbar_enabled.get(identifier, True):
-                    return identifier
-                return None
+                # Return disabled controls too so the modal owner can report
+                # the reason and consume the click instead of falling through
+                # into Draw or selection.
+                return identifier
         return None
 
     def toolbar_hover_test(self, mouse_region):
